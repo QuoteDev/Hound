@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# Local tooling
+.codex/
+.claude/
+**/.claude/
+
+# Python
+**/.venv/
+**/__pycache__/
+**/*.pyc
+
+# Node/Electron
+**/node_modules/
+**/.npm/
+
+# Build artifacts
+**/dist/
+**/dist-*/
+**/build/
+**/build-*/
+**/release/
+**/.pyinstaller-cache/
+**/*.egg-info/
+
+# Runtime / local data
+**/session_store/
+**/*.db
+**/runtime/
+
+# Logs
+**/*.log

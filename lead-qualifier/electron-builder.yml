@@ -1,0 +1,40 @@
+appId: com.hound.suite
+productName: Hound Suite
+artifactName: Hound-Suite-${version}-${os}-${arch}.${ext}
+directories:
+  output: release
+files:
+  - desktop/**/*
+  - static/**/*
+  - resources/**/*
+  - server.py
+  - domain_cache.py
+  - domain_validator.py
+  - homepage_signals.py
+  - requirements.txt
+extraResources:
+  - from: dist-sidecar/
+    to: sidecar/
+    filter:
+      - '**/*'
+publish:
+  - provider: github
+    owner: ${env.GH_REPO_OWNER}
+    repo: ${env.GH_REPO_NAME}
+    releaseType: release
+mac:
+  category: public.app-category.productivity
+  target:
+    - dmg
+    - zip
+  hardenedRuntime: false
+  gatekeeperAssess: false
+win:
+  target:
+    - nsis
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true

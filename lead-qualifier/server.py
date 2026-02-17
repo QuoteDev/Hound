@@ -1,0 +1,3757 @@
+#!/usr/bin/env python3
+"""
+Lead Qualifier API — FastAPI + Polars + RapidFuzz
+Upload CSVs, define ICP rules, fuzzy-match, and export qualified leads.
+Includes async concurrent domain liveness verification.
+"""
+
+import asyncio
+import argparse
+import io
+import json
+import os
+import pickle
+import re
+import shutil
+import ssl
+import sys
+import tempfile
+import time
+import traceback
+from datetime import datetime
+from uuid import uuid4
+from typing import Any, Optional
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import aiohttp
+import polars as pl
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from rapidfuzz import fuzz
+
+# Import DNS-based domain validation
+from domain_validator import check_domains_dns_batch, get_cdn_reference_data
+from domain_cache import init_cache, get_cache_stats, clear_all_cache
+from homepage_signals import collect_homepage_signals_batch
+
+app = FastAPI(title="Kennel — Hound Suite")
+
+APP_BASE_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_data_dir_from_env() -> Path:
+    raw = str(os.getenv("HOUND_DATA_DIR") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    if getattr(sys, "frozen", False):
+        return Path.home() / ".hound-qualifier"
+    return APP_BASE_DIR
+
+
+DATA_DIR = _resolve_data_dir_from_env()
+
+STATIC_DIR = APP_BASE_DIR / "static"
+FONTS_DIR = APP_BASE_DIR / "resources" / "fonts"
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
+SESSION_STORE: dict[str, dict] = {}
+SESSION_STORE_DIR = DATA_DIR / "session_store"
+SESSION_FILE_SUFFIX = ".session.pkl"
+APP_BOOT_TS = time.time()
+
+
+def _refresh_data_paths_from_env() -> None:
+    global DATA_DIR, SESSION_STORE_DIR
+    DATA_DIR = _resolve_data_dir_from_env()
+    SESSION_STORE_DIR = DATA_DIR / "session_store"
+
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB limit (supports 600k+ rows)
+PREVIEW_ROW_LIMIT = 8
+TYPE_SAMPLE_LIMIT = 250
+VALUE_SAMPLE_SCAN_LIMIT = 5000
+VALUE_SAMPLE_LIMIT = 50
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+URL_RE = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
+DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}(?:/.*)?$", re.IGNORECASE)
+NUMERIC_RE = re.compile(r"^-?\d+(?:[.,]\d+)?$")
+RESOLVED_IPS_COLUMN = "resolved_ips"
+HTML_LANG_COLUMN = "html_lang"
+CURRENCY_SIGNALS_COLUMN = "currency_signals"
+META_TITLE_COLUMN = "meta_title"
+META_DESCRIPTION_COLUMN = "meta_description"
+B2B_SCORE_COLUMN = "b2b_score"
+US_SIGNALS_COLUMN = "us_signals"
+WEBSITE_KEYWORDS_MATCH_COLUMN = "website_keywords_match"
+HOMEPAGE_STATUS_COLUMN = "homepage_status"
+
+
+@app.get("/")
+async def root():
+    return RedirectResponse("/static/index.html")
+
+
+@app.get("/api/health")
+async def health():
+    """Lightweight readiness probe for desktop shell startup checks."""
+    return {
+        "ok": True,
+        "app": "hound-suite",
+        "uptimeSeconds": round(max(0.0, time.time() - APP_BOOT_TS), 3),
+        "dataDir": str(DATA_DIR),
+    }
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize domain cache on server startup."""
+    _prepare_runtime_data_layout()
+    await init_cache()
+    _load_persisted_sessions()
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _prepare_runtime_data_layout() -> None:
+    """
+    Ensure writable runtime storage exists and migrate legacy local files on first run.
+    """
+    _refresh_data_paths_from_env()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["HOUND_DATA_DIR"] = str(DATA_DIR)
+
+    if DATA_DIR == APP_BASE_DIR:
+        return
+
+    legacy_cache_db = APP_BASE_DIR / "domain_cache.db"
+    target_cache_db = DATA_DIR / "domain_cache.db"
+    if legacy_cache_db.exists() and not target_cache_db.exists():
+        try:
+            shutil.copy2(legacy_cache_db, target_cache_db)
+        except Exception:
+            traceback.print_exc()
+
+    legacy_session_store = APP_BASE_DIR / "session_store"
+    if legacy_session_store.exists() and legacy_session_store.is_dir():
+        for path in legacy_session_store.glob(f"*{SESSION_FILE_SUFFIX}"):
+            target = SESSION_STORE_DIR / path.name
+            if target.exists():
+                continue
+            try:
+                shutil.copy2(path, target)
+            except Exception:
+                traceback.print_exc()
+
+def ensure_csv_filename(file_name: Optional[str]) -> None:
+    """Validate incoming file extension for CSV-focused flows."""
+    if not file_name:
+        return
+    lower = file_name.lower()
+    if not (lower.endswith(".csv") or lower.endswith(".txt") or lower.endswith(".tsv")):
+        raise HTTPException(status_code=400, detail="Only CSV/TSV uploads are supported.")
+
+
+async def read_upload_bytes(file: UploadFile, max_bytes: int = MAX_UPLOAD_BYTES) -> bytes:
+    """Read uploaded file in chunks with explicit size guard."""
+    ensure_csv_filename(file.filename)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Upload exceeds {max_bytes // (1024 * 1024)}MB limit.",
+            )
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    return raw
+
+
+def detect_csv_separator(raw: bytes) -> str:
+    """Infer likely CSV delimiter from early lines."""
+    probe = raw[:8192].decode("utf-8-sig", errors="replace")
+    lines = [ln for ln in probe.splitlines()[:5] if ln.strip()]
+    if not lines:
+        return ","
+    candidates = [",", ";", "\t", "|"]
+    scores = {}
+    for sep in candidates:
+        counts = [line.count(sep) for line in lines]
+        scores[sep] = (sum(counts), max(counts) if counts else 0)
+    best = max(candidates, key=lambda sep: (scores[sep][0], scores[sep][1]))
+    return best if scores[best][0] > 0 else ","
+
+
+def sanitize_column_names(columns: list[str]) -> list[str]:
+    """Normalize blank/duplicate headers while preserving readability."""
+    seen: dict[str, int] = {}
+    normalized = []
+    for idx, raw_name in enumerate(columns, start=1):
+        base = (raw_name or "").strip()
+        if not base:
+            base = f"column_{idx}"
+        key = base.lower()
+        count = seen.get(key, 0) + 1
+        seen[key] = count
+        normalized.append(base if count == 1 else f"{base}_{count}")
+    return normalized
+
+
+def parse_numeric_value(value: str) -> Optional[float]:
+    """Parse numeric-like strings across common CSV formats."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    cleaned = raw.replace("$", "").replace("%", "").replace(" ", "")
+    if cleaned.count(",") > 0 and cleaned.count(".") > 0:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            # EU style: 1.234,56
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            # US style: 1,234.56
+            cleaned = cleaned.replace(",", "")
+    elif cleaned.count(",") > 0 and cleaned.count(".") == 0:
+        # Could be decimal comma or thousands separator.
+        if cleaned.count(",") == 1 and len(cleaned.split(",")[1]) <= 2:
+            cleaned = cleaned.replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
+
+
+def looks_like_date(value: str) -> bool:
+    """Check whether a scalar resembles a date/time string."""
+    raw = str(value).strip()
+    if not raw:
+        return False
+    sample = raw.replace("/", "-").replace(".", "-")
+    fmts = (
+        "%Y-%m-%d",
+        "%m-%d-%Y",
+        "%d-%m-%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%z",
+    )
+    for fmt in fmts:
+        try:
+            datetime.strptime(sample, fmt)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def sample_distinct_values(series: pl.Series, limit: int = VALUE_SAMPLE_LIMIT, scan_limit: int = VALUE_SAMPLE_SCAN_LIMIT) -> list[str]:
+    """Collect an ordered distinct sample without materializing full unique sets."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in series.head(scan_limit).to_list():
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def read_csv_bytes(raw: bytes) -> pl.DataFrame:
+    """Read CSV bytes with delimiter detection and resilient parsing."""
+    separator_hint = detect_csv_separator(raw)
+    separators = [separator_hint] + [sep for sep in [",", ";", "\t", "|"] if sep != separator_hint]
+    read_errors = []
+    parsed_candidates: list[tuple[str, pl.DataFrame]] = []
+
+    for sep in separators:
+        try:
+            df = pl.read_csv(
+                io.BytesIO(raw),
+                separator=sep,
+                infer_schema_length=500,
+                try_parse_dates=False,
+                truncate_ragged_lines=True,
+                ignore_errors=True,
+                null_values=["", "null", "NULL", "n/a", "N/A", "na", "NA"],
+            )
+            if df.width > 0:
+                parsed_candidates.append((sep, df))
+        except Exception as exc:
+            read_errors.append(str(exc))
+
+    if parsed_candidates:
+        # Prefer parses with more than one column; among those pick the widest schema.
+        multi_col = [(sep, df) for sep, df in parsed_candidates if df.width > 1]
+        chosen_sep, chosen_df = max(
+            multi_col if multi_col else parsed_candidates,
+            key=lambda item: item[1].width,
+        )
+        _ = chosen_sep  # Reserved for future diagnostics.
+        cleaned_names = sanitize_column_names(chosen_df.columns)
+        if cleaned_names != chosen_df.columns:
+            chosen_df = chosen_df.rename(dict(zip(chosen_df.columns, cleaned_names)))
+        return chosen_df
+
+    # Final fallback with forgiving UTF-8 decode.
+    text = raw.decode("utf-8-sig", errors="replace")
+    df = pl.read_csv(
+        io.StringIO(text),
+        infer_schema_length=500,
+        try_parse_dates=False,
+        truncate_ragged_lines=True,
+        ignore_errors=True,
+    )
+    cleaned_names = sanitize_column_names(df.columns)
+    if cleaned_names != df.columns:
+        df = df.rename(dict(zip(df.columns, cleaned_names)))
+    if df.width == 0:
+        raise HTTPException(status_code=400, detail=f"Unable to parse CSV. {read_errors[:1]}")
+    return df
+
+
+def infer_column_type(col_name: str, series: pl.Series) -> str:
+    """Infer a lightweight semantic type for UI previews."""
+    name = (col_name or "").lower()
+    if any(k in name for k in ("email", "mail")):
+        return "email"
+    if any(k in name for k in ("url", "website", "domain", "link", "site")):
+        return "link"
+    if any(k in name for k in ("date", "time", "created", "updated")):
+        return "date"
+
+    sample = [str(v).strip() for v in series.drop_nulls().head(TYPE_SAMPLE_LIMIT).to_list() if str(v).strip()]
+    if not sample:
+        return "text"
+
+    total = len(sample)
+    lower = [s.lower() for s in sample]
+    email_count = sum(1 for s in lower if EMAIL_RE.match(s))
+    link_count = sum(1 for s in lower if URL_RE.match(s) or DOMAIN_RE.match(s))
+    bool_count = sum(1 for s in lower if s in ("true", "false", "yes", "no", "1", "0"))
+    date_count = sum(1 for s in sample if looks_like_date(s))
+    numeric_count = sum(1 for s in sample if parse_numeric_value(s) is not None or NUMERIC_RE.match(s))
+
+    if email_count / total >= 0.65:
+        return "email"
+    if link_count / total >= 0.6:
+        return "link"
+    if date_count / total >= 0.55:
+        return "date"
+    if bool_count / total >= 0.8:
+        return "boolean"
+    if numeric_count / total >= 0.65:
+        return "number"
+    return "text"
+
+
+HEADER_TOKEN_ALIASES = {
+    "e-mail": "email",
+    "mail": "email",
+    "emails": "email",
+    "website": "website",
+    "web": "website",
+    "site": "website",
+    "url": "website",
+    "urls": "website",
+    "homepage": "website",
+    "domain": "website",
+    "domains": "website",
+    "organisation": "company",
+    "organization": "company",
+    "org": "company",
+    "account": "company",
+    "business": "company",
+    "companyname": "company",
+    "linkedinurl": "linkedin",
+    "linkedinprofile": "linkedin",
+    "li": "linkedin",
+    "telephone": "phone",
+    "tel": "phone",
+    "mobile": "phone",
+    "fname": "first",
+    "given": "first",
+    "lname": "last",
+    "surname": "last",
+    "arr": "revenue",
+    "headcount": "employees",
+    "staff": "employees",
+}
+
+GENERIC_HEADER_TOKENS = {"name", "type", "value", "id", "status", "date", "description"}
+
+
+def _tokenize_header_name(value: str) -> list[str]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return []
+    collapsed = re.sub(r"[^a-z0-9]+", " ", raw).strip()
+    if not collapsed:
+        return []
+    tokens = []
+    for token in collapsed.split():
+        mapped = HEADER_TOKEN_ALIASES.get(token, token)
+        tokens.append(mapped)
+    return tokens
+
+
+def _normalize_header_name(value: str) -> str:
+    return " ".join(_tokenize_header_name(value))
+
+
+def _header_match_score(
+    source_name: str,
+    source_type: str,
+    canonical_name: str,
+    canonical_type: str,
+) -> tuple[float, str]:
+    source_norm = _normalize_header_name(source_name)
+    canonical_norm = _normalize_header_name(canonical_name)
+    if not source_norm or not canonical_norm:
+        return 0.0, "none"
+
+    if source_norm == canonical_norm:
+        return 100.0, "normalized_exact"
+
+    source_tokens = source_norm.split()
+    canonical_tokens = canonical_norm.split()
+    score = float(fuzz.token_set_ratio(source_norm, canonical_norm))
+    strategy = "fuzzy"
+
+    if (
+        len(source_tokens) == 1
+        and len(canonical_tokens) > 1
+        and source_tokens[0] in GENERIC_HEADER_TOKENS
+    ):
+        score -= 16
+    if (
+        len(canonical_tokens) == 1
+        and len(source_tokens) > 1
+        and canonical_tokens[0] in GENERIC_HEADER_TOKENS
+    ):
+        score -= 16
+
+    if source_type == canonical_type:
+        score += 2
+    elif source_type != "text" and canonical_type != "text":
+        score -= 12
+
+    return max(0.0, min(100.0, score)), strategy
+
+
+def merge_dataframes_with_schema_mapping(
+    datasets: list[dict[str, Any]],
+    match_threshold: float = 92.0,
+) -> tuple[pl.DataFrame, list[dict]]:
+    """
+    Merge multiple parsed dataframes by smart column-name mapping.
+    Columns with strong semantic/name similarity are merged; otherwise
+    they are preserved as unique columns in the consolidated frame.
+    """
+    if not datasets:
+        return pl.DataFrame(), []
+
+    canonical_columns: list[dict[str, str]] = []
+    mapped_frames: list[pl.DataFrame] = []
+    mapping_report: list[dict] = []
+
+    for item in datasets:
+        file_name = str(item.get("fileName") or "dataset.csv")
+        df = item.get("df")
+        if not isinstance(df, pl.DataFrame):
+            continue
+
+        assigned_targets: set[str] = set()
+        column_aliases: list[tuple[str, str]] = []
+        mapped_columns: list[dict] = []
+
+        for col in df.columns:
+            inferred_type = infer_column_type(col, df[col].cast(pl.Utf8, strict=False))
+            target = col
+            strategy = "new_column"
+            score = 100.0
+
+            best_match = None
+            best_score = -1.0
+            best_strategy = "none"
+            for canonical in canonical_columns:
+                canonical_name = canonical["name"]
+                if canonical_name in assigned_targets:
+                    continue
+                candidate_score, candidate_strategy = _header_match_score(
+                    source_name=col,
+                    source_type=inferred_type,
+                    canonical_name=canonical_name,
+                    canonical_type=canonical["inferredType"],
+                )
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_match = canonical_name
+                    best_strategy = candidate_strategy
+
+            if best_match and best_score >= match_threshold:
+                target = best_match
+                strategy = best_strategy
+                score = best_score
+            else:
+                canonical_columns.append({
+                    "name": col,
+                    "inferredType": inferred_type,
+                })
+
+            assigned_targets.add(target)
+            column_aliases.append((col, target))
+            mapped_columns.append({
+                "sourceColumn": col,
+                "targetColumn": target,
+                "matchScore": round(score, 2),
+                "strategy": strategy,
+            })
+
+        mapped_df = df.select([pl.col(source).alias(target) for source, target in column_aliases])
+        mapped_frames.append(mapped_df)
+        mapping_report.append({
+            "fileName": file_name,
+            "columns": mapped_columns,
+        })
+
+    if not mapped_frames:
+        return pl.DataFrame(), mapping_report
+
+    combined = pl.concat(mapped_frames, how="diagonal_relaxed")
+    cleaned_names = sanitize_column_names(combined.columns)
+    if cleaned_names != combined.columns:
+        combined = combined.rename(dict(zip(combined.columns, cleaned_names)))
+    return combined, mapping_report
+
+
+def _resolve_upload_files(
+    files: Optional[list[UploadFile]],
+    file: Optional[UploadFile],
+) -> list[UploadFile]:
+    resolved = [f for f in (files or []) if f is not None]
+    if file is not None:
+        resolved.insert(0, file)
+    return resolved
+
+
+def _summarize_file_names(file_names: list[str], fallback: str) -> str:
+    cleaned = [str(name or "").strip() for name in file_names if str(name or "").strip()]
+    if not cleaned:
+        return fallback
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return f"{cleaned[0]} + {len(cleaned) - 1} more"
+
+
+async def _parse_upload_datasets(upload_files: list[UploadFile], label: str) -> dict[str, Any]:
+    if not upload_files:
+        raise HTTPException(status_code=400, detail=f"No {label} files were uploaded.")
+
+    parsed: list[dict[str, Any]] = []
+    for idx, upload in enumerate(upload_files, start=1):
+        raw = await read_upload_bytes(upload)
+        df = read_csv_bytes(raw)
+        file_name = str(upload.filename or f"{label}_{idx}.csv")
+        parsed.append({
+            "fileName": file_name,
+            "raw": raw,
+            "df": df,
+            "rows": df.height,
+            "columns": df.width,
+        })
+
+    combined_df, mapping = merge_dataframes_with_schema_mapping(parsed)
+    return {
+        "df": combined_df,
+        "mapping": mapping,
+        "fileNames": [item["fileName"] for item in parsed],
+        "raws": [item["raw"] for item in parsed],
+        "inputRows": int(sum(item["rows"] for item in parsed)),
+        "inputColumns": int(max((item["columns"] for item in parsed), default=0)),
+    }
+
+
+def build_columns_info(df: pl.DataFrame) -> tuple[list[dict], list[dict]]:
+    """Return legacy columns info plus richer column profiles."""
+    columns_info = []
+    column_profiles = []
+    total_rows = max(df.height, 1)
+
+    for col in df.columns:
+        utf_series = df[col].cast(pl.Utf8, strict=False)
+        non_null = utf_series.drop_nulls()
+        unique_count = int(non_null.n_unique()) if non_null.len() else 0
+        sample = sample_distinct_values(non_null, limit=VALUE_SAMPLE_LIMIT, scan_limit=VALUE_SAMPLE_SCAN_LIMIT)
+        null_count = df.height - non_null.len()
+
+        columns_info.append({
+            "name": col,
+            "dataType": str(df[col].dtype),
+            "uniqueCount": unique_count,
+            "sampleValues": sample,
+            "totalRows": df.height,
+        })
+
+        column_profiles.append({
+            "name": col,
+            "dataType": str(df[col].dtype),
+            "inferredType": infer_column_type(col, utf_series),
+            "nullRate": round(null_count / total_rows, 4),
+            "uniqueCount": unique_count,
+            "sampleValues": sample[:8],
+        })
+    return columns_info, column_profiles
+
+
+def build_column_anomalies(column_profiles: list[dict], total_rows: int) -> dict:
+    """Return lightweight data-shape anomalies for UI confidence panels."""
+    empty_heavy = []
+    duplicate_heavy = []
+    if total_rows <= 0:
+        return {"emptyHeavyColumns": empty_heavy, "duplicateHeavyColumns": duplicate_heavy}
+
+    for profile in column_profiles:
+        name = profile.get("name", "")
+        null_rate = float(profile.get("nullRate", 0))
+        unique_count = int(profile.get("uniqueCount", 0))
+        distinct_ratio = unique_count / max(total_rows, 1)
+        if null_rate >= 0.45:
+            empty_heavy.append({"name": name, "nullRate": round(null_rate, 3)})
+        if distinct_ratio <= 0.08:
+            duplicate_heavy.append({"name": name, "distinctRatio": round(distinct_ratio, 3)})
+
+    return {
+        "emptyHeavyColumns": empty_heavy[:6],
+        "duplicateHeavyColumns": duplicate_heavy[:6],
+    }
+
+
+def _safe_parse_iso_datetime(value: str) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    candidate = raw.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(candidate)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(f"{candidate}T00:00:00")
+    except ValueError:
+        return None
+
+
+def _build_view_filter_expr(view_filter: dict, columns: list[str]) -> Optional[pl.Expr]:
+    field = str(view_filter.get("field") or "").strip()
+    op = str(view_filter.get("op") or "").strip().lower()
+    value = str(view_filter.get("value") or "").strip()
+
+    if not field or field not in columns:
+        return None
+
+    text_col = pl.col(field).cast(pl.Utf8, strict=False).fill_null("")
+    lower_col = text_col.str.to_lowercase()
+    lower_value = value.lower()
+
+    if op == "contains":
+        if not value:
+            return None
+        return lower_col.str.contains(lower_value, literal=True)
+    if op == "equals":
+        return lower_col == lower_value
+    if op == "not_equals":
+        return lower_col != lower_value
+    if op == "is_empty":
+        return text_col.str.strip_chars() == ""
+    if op == "is_not_empty":
+        return text_col.str.strip_chars() != ""
+    if op in ("before", "after"):
+        target_dt = _safe_parse_iso_datetime(value)
+        if target_dt:
+            parsed_col = text_col.str.strptime(pl.Datetime, strict=False)
+            return parsed_col < target_dt if op == "before" else parsed_col > target_dt
+        if not value:
+            return None
+        return text_col < value if op == "before" else text_col > value
+    return None
+
+
+def _apply_view_filters(df: pl.DataFrame, view_filters_raw: str, allowed_columns: list[str]) -> pl.DataFrame:
+    raw = str(view_filters_raw or "").strip() or "[]"
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid viewFilters payload.") from exc
+
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=400, detail="viewFilters payload must be an array.")
+
+    working = df
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        expr = _build_view_filter_expr(item, allowed_columns)
+        if expr is not None:
+            working = working.filter(expr)
+    return working
+
+
+def _session_file_path(session_id: str) -> Path:
+    return SESSION_STORE_DIR / f"{session_id}{SESSION_FILE_SUFFIX}"
+
+
+def _compact_run_snapshot(run: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
+    if not isinstance(run, dict):
+        return None
+
+    timestamp = now or time.time()
+    status = str(run.get("status") or "idle")
+    compact = {
+        "runId": run.get("runId"),
+        "status": status,
+        "stage": run.get("stage", "idle"),
+        "progress": float(run.get("progress", 0.0)),
+        "message": run.get("message", ""),
+        "processedRows": int(run.get("processedRows", 0)),
+        "totalRows": int(run.get("totalRows", 0)),
+        "qualifiedCount": int(run.get("qualifiedCount", 0)),
+        "removedCount": int(run.get("removedCount", 0)),
+        "removedBreakdown": run.get("removedBreakdown", {
+            "removedFilter": 0,
+            "removedDomain": 0,
+            "removedHubspot": 0,
+        }),
+        "startedAt": run.get("startedAt"),
+        "finishedAt": run.get("finishedAt"),
+        "error": run.get("error", ""),
+    }
+
+    if status == "running":
+        compact.update({
+            "status": "error",
+            "stage": "error",
+            "progress": 1.0,
+            "message": "Qualification was interrupted when the server restarted.",
+            "error": "interrupted_by_restart",
+            "finishedAt": timestamp,
+        })
+
+    if status == "running":
+        for key in (
+            "qualifiedIds",
+            "removedFilterIds",
+            "removedDomainIds",
+            "removedHubspotIds",
+        ):
+            value = run.get(key)
+            if isinstance(value, set):
+                compact[key] = set(value)
+            elif isinstance(value, list):
+                compact[key] = set(value)
+            else:
+                compact[key] = set()
+        compact["removedFilterReasonById"] = dict(run.get("removedFilterReasonById") or {})
+        compact["removedDomainReasonById"] = dict(run.get("removedDomainReasonById") or {})
+    else:
+        compact["qualifiedIds"] = set()
+        compact["removedFilterIds"] = set()
+        compact["removedDomainIds"] = set()
+        compact["removedHubspotIds"] = set()
+        compact["removedFilterReasonById"] = {}
+        compact["removedDomainReasonById"] = {}
+    return compact
+
+
+def _serialize_session_for_disk(session_id: str, session: dict) -> dict:
+    source_raws = [raw for raw in (session.get("sourceRaws") or []) if raw]
+    csv_raw = session.get("csvRaw")
+    if not source_raws and csv_raw:
+        source_raws = [csv_raw]
+
+    dedupe_raws = [raw for raw in (session.get("dedupeRaws") or []) if raw]
+    dedupe_raw = session.get("dedupeRaw")
+    if not dedupe_raws and dedupe_raw:
+        dedupe_raws = [dedupe_raw]
+
+    return {
+        "sessionId": session_id,
+        "csvRaw": csv_raw,
+        "fileName": session.get("fileName"),
+        "sourceFileNames": list(session.get("sourceFileNames") or []),
+        "sourceRaws": source_raws,
+        "sourceMapping": list(session.get("sourceMapping") or []),
+        "sourceRows": int(session.get("sourceRows") or 0),
+        "columns": list(session.get("columns") or []),
+        "columnProfiles": list(session.get("columnProfiles") or []),
+        "previewRows": list(session.get("previewRows") or []),
+        "anomalies": dict(session.get("anomalies") or {}),
+        "dedupeRaw": dedupe_raw,
+        "dedupeName": session.get("dedupeName"),
+        "dedupeFileNames": list(session.get("dedupeFileNames") or []),
+        "dedupeRaws": dedupe_raws,
+        "dedupeMapping": list(session.get("dedupeMapping") or []),
+        "dedupeSourceRows": int(session.get("dedupeSourceRows") or 0),
+        "activeRun": _compact_run_snapshot(session.get("activeRun")),
+        "lastRunStatus": session.get("lastRunStatus"),
+        "createdAt": float(session.get("createdAt") or time.time()),
+        "updatedAt": float(session.get("updatedAt") or time.time()),
+    }
+
+
+def _persist_session(session_id: str, session: dict) -> None:
+    try:
+        SESSION_STORE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _session_file_path(session_id)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        payload = _serialize_session_for_disk(session_id, session)
+        with tmp.open("wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+    except Exception:
+        traceback.print_exc()
+
+
+def _delete_persisted_session(session_id: str) -> None:
+    path = _session_file_path(session_id)
+    if path.exists():
+        try:
+            path.unlink()
+        except Exception:
+            traceback.print_exc()
+
+
+def _load_persisted_sessions() -> None:
+    SESSION_STORE.clear()
+    SESSION_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+
+    for path in SESSION_STORE_DIR.glob(f"*{SESSION_FILE_SUFFIX}"):
+        try:
+            with path.open("rb") as handle:
+                payload = pickle.load(handle)
+        except Exception:
+            try:
+                path.unlink()
+            except Exception:
+                traceback.print_exc()
+            continue
+
+        if not isinstance(payload, dict):
+            try:
+                path.unlink()
+            except Exception:
+                traceback.print_exc()
+            continue
+
+        session_id = str(payload.get("sessionId") or "").strip() or path.name[: -len(SESSION_FILE_SUFFIX)]
+        updated_at = float(payload.get("updatedAt") or now)
+        if (now - updated_at) > SESSION_TTL_SECONDS:
+            try:
+                path.unlink()
+            except Exception:
+                traceback.print_exc()
+            continue
+
+        SESSION_STORE[session_id] = {
+            "csvRaw": payload.get("csvRaw"),
+            "df": None,
+            "fileName": payload.get("fileName") or "dataset.csv",
+            "sourceFileNames": list(payload.get("sourceFileNames") or []),
+            "sourceRaws": list(payload.get("sourceRaws") or []),
+            "sourceMapping": list(payload.get("sourceMapping") or []),
+            "sourceRows": int(payload.get("sourceRows") or 0),
+            "columns": list(payload.get("columns") or []),
+            "columnProfiles": list(payload.get("columnProfiles") or []),
+            "previewRows": list(payload.get("previewRows") or []),
+            "anomalies": dict(payload.get("anomalies") or {}),
+            "dedupeRaw": payload.get("dedupeRaw"),
+            "dedupeName": payload.get("dedupeName"),
+            "dedupeFileNames": list(payload.get("dedupeFileNames") or []),
+            "dedupeRaws": list(payload.get("dedupeRaws") or []),
+            "dedupeMapping": list(payload.get("dedupeMapping") or []),
+            "dedupeSourceRows": int(payload.get("dedupeSourceRows") or 0),
+            "dedupeDf": None,
+            "activeRun": _compact_run_snapshot(payload.get("activeRun"), now=now),
+            "lastRunResult": None,
+            "lastRunStatus": payload.get("lastRunStatus"),
+            "createdAt": float(payload.get("createdAt") or updated_at),
+            "updatedAt": updated_at,
+        }
+
+
+def _clean_stale_sessions() -> None:
+    now = time.time()
+    stale = [sid for sid, payload in SESSION_STORE.items() if (now - payload.get("updatedAt", now)) > SESSION_TTL_SECONDS]
+    for sid in stale:
+        SESSION_STORE.pop(sid, None)
+        _delete_persisted_session(sid)
+
+
+def _put_session(
+    raw_csv: bytes,
+    file_name: str,
+    df: pl.DataFrame,
+    columns_info: list[dict],
+    column_profiles: list[dict],
+    preview_rows: list[dict],
+    anomalies: dict,
+    dedupe_raw: Optional[bytes] = None,
+    dedupe_name: Optional[str] = None,
+    dedupe_df: Optional[pl.DataFrame] = None,
+    source_raws: Optional[list[bytes]] = None,
+    source_file_names: Optional[list[str]] = None,
+    source_mapping: Optional[list[dict]] = None,
+    source_rows: Optional[int] = None,
+    dedupe_raws: Optional[list[bytes]] = None,
+    dedupe_file_names: Optional[list[str]] = None,
+    dedupe_mapping: Optional[list[dict]] = None,
+    dedupe_source_rows: Optional[int] = None,
+) -> str:
+    _clean_stale_sessions()
+    sid = uuid4().hex
+    now = time.time()
+    SESSION_STORE[sid] = {
+        "csvRaw": raw_csv,
+        "df": df,
+        "fileName": file_name,
+        "sourceFileNames": list(source_file_names or ([file_name] if file_name else [])),
+        "sourceRaws": list(source_raws or ([raw_csv] if raw_csv else [])),
+        "sourceMapping": list(source_mapping or []),
+        "sourceRows": int(source_rows if source_rows is not None else df.height),
+        "columns": columns_info,
+        "columnProfiles": column_profiles,
+        "previewRows": preview_rows,
+        "anomalies": anomalies,
+        "dedupeRaw": dedupe_raw,
+        "dedupeName": dedupe_name,
+        "dedupeFileNames": list(dedupe_file_names or ([dedupe_name] if dedupe_name else [])),
+        "dedupeRaws": list(dedupe_raws or ([dedupe_raw] if dedupe_raw else [])),
+        "dedupeMapping": list(dedupe_mapping or []),
+        "dedupeSourceRows": int(dedupe_source_rows if dedupe_source_rows is not None else (dedupe_df.height if isinstance(dedupe_df, pl.DataFrame) else 0)),
+        "dedupeDf": dedupe_df,
+        "activeRun": None,
+        "lastRunResult": None,
+        "lastRunStatus": None,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    _persist_session(sid, SESSION_STORE[sid])
+    return sid
+
+
+def _touch_session(sid: str) -> dict:
+    _clean_stale_sessions()
+    session = SESSION_STORE.get(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired.")
+    session["updatedAt"] = time.time()
+    return session
+
+
+def _set_session_dedupe(
+    sid: str,
+    dedupe_raw: Optional[bytes],
+    dedupe_name: Optional[str],
+    dedupe_df: Optional[pl.DataFrame] = None,
+    dedupe_raws: Optional[list[bytes]] = None,
+    dedupe_file_names: Optional[list[str]] = None,
+    dedupe_mapping: Optional[list[dict]] = None,
+    dedupe_source_rows: Optional[int] = None,
+) -> dict:
+    session = _touch_session(sid)
+    session["dedupeRaw"] = dedupe_raw
+    session["dedupeName"] = dedupe_name
+    session["dedupeRaws"] = list(dedupe_raws or ([dedupe_raw] if dedupe_raw else []))
+    session["dedupeFileNames"] = list(dedupe_file_names or ([dedupe_name] if dedupe_name else []))
+    session["dedupeMapping"] = list(dedupe_mapping or [])
+    session["dedupeSourceRows"] = int(dedupe_source_rows if dedupe_source_rows is not None else (dedupe_df.height if isinstance(dedupe_df, pl.DataFrame) else 0))
+    session["dedupeDf"] = dedupe_df
+    session["updatedAt"] = time.time()
+    _persist_session(sid, session)
+    return session
+
+
+def _get_session_df(session: dict) -> pl.DataFrame:
+    """Get cached parsed source dataframe, parsing once if needed."""
+    if isinstance(session.get("df"), pl.DataFrame):
+        return session["df"]
+    source_raws = [raw for raw in (session.get("sourceRaws") or []) if raw]
+    if len(source_raws) > 1:
+        parsed = [{
+            "fileName": file_name or f"source_{idx + 1}.csv",
+            "df": read_csv_bytes(raw),
+        } for idx, (file_name, raw) in enumerate(
+            zip(session.get("sourceFileNames") or [], source_raws)
+        )]
+        if len(parsed) < len(source_raws):
+            for idx in range(len(parsed), len(source_raws)):
+                parsed.append({
+                    "fileName": f"source_{idx + 1}.csv",
+                    "df": read_csv_bytes(source_raws[idx]),
+                })
+        df, mapping = merge_dataframes_with_schema_mapping(parsed)
+        session["sourceMapping"] = mapping
+    else:
+        df = read_csv_bytes(session["csvRaw"])
+    session["df"] = df
+    if not session.get("sourceRows"):
+        session["sourceRows"] = int(df.height)
+    if not session.get("columns") or not session.get("columnProfiles"):
+        columns_info, column_profiles = build_columns_info(df)
+        session["columns"] = columns_info
+        session["columnProfiles"] = column_profiles
+        session["previewRows"] = df.head(PREVIEW_ROW_LIMIT).to_dicts()
+        session["anomalies"] = build_column_anomalies(column_profiles, df.height)
+        session["updatedAt"] = time.time()
+    return df
+
+
+def _get_session_dedupe_df(session: dict) -> Optional[pl.DataFrame]:
+    """Get cached parsed dedupe dataframe, parsing once if needed."""
+    dedupe_df = session.get("dedupeDf")
+    if isinstance(dedupe_df, pl.DataFrame):
+        return dedupe_df
+    dedupe_raws = [raw for raw in (session.get("dedupeRaws") or []) if raw]
+    if len(dedupe_raws) > 1:
+        parsed = []
+        names = session.get("dedupeFileNames") or []
+        for idx, raw in enumerate(dedupe_raws, start=1):
+            parsed.append({
+                "fileName": names[idx - 1] if idx - 1 < len(names) else f"dedupe_{idx}.csv",
+                "df": read_csv_bytes(raw),
+            })
+        combined, mapping = merge_dataframes_with_schema_mapping(parsed)
+        session["dedupeDf"] = combined
+        session["dedupeMapping"] = mapping
+        if not session.get("dedupeSourceRows"):
+            session["dedupeSourceRows"] = int(combined.height)
+        return combined
+    dedupe_raw = session.get("dedupeRaw")
+    if not dedupe_raw:
+        return None
+    parsed = read_csv_bytes(dedupe_raw)
+    session["dedupeDf"] = parsed
+    if not session.get("dedupeSourceRows"):
+        session["dedupeSourceRows"] = int(parsed.height)
+    return parsed
+
+
+def _rebuild_dedupe_from_raws(
+    dedupe_raws: list[bytes],
+    dedupe_file_names: list[str],
+) -> tuple[Optional[pl.DataFrame], list[dict], int]:
+    """
+    Parse and merge all dedupe raws into one dataframe.
+    Returns (merged_df, mapping_report, input_rows_total).
+    """
+    clean_raws = [raw for raw in (dedupe_raws or []) if raw]
+    if not clean_raws:
+        return None, [], 0
+
+    parsed: list[dict[str, Any]] = []
+    input_rows = 0
+    for idx, raw in enumerate(clean_raws, start=1):
+        file_name = (
+            dedupe_file_names[idx - 1]
+            if idx - 1 < len(dedupe_file_names) and str(dedupe_file_names[idx - 1] or "").strip()
+            else f"dedupe_{idx}.csv"
+        )
+        df = read_csv_bytes(raw)
+        input_rows += int(df.height)
+        parsed.append({
+            "fileName": file_name,
+            "df": df,
+        })
+
+    merged_df, mapping = merge_dataframes_with_schema_mapping(parsed)
+    return merged_df, mapping, input_rows
+
+
+def _build_session_payload(session_id: str, session: dict) -> dict[str, Any]:
+    source_df = _get_session_df(session)
+    source_file_names = list(session.get("sourceFileNames") or [])
+    source_name = session.get("fileName") or _summarize_file_names(source_file_names, "dataset.csv")
+    dedupe_df = _get_session_dedupe_df(session)
+    dedupe_file_names = list(session.get("dedupeFileNames") or [])
+    dedupe_name = session.get("dedupeName") or (_summarize_file_names(dedupe_file_names, "hubspot.csv") if dedupe_file_names else None)
+
+    dedupe_payload: dict[str, Any] = {
+        "enabled": bool(dedupe_df is not None and dedupe_df.height > 0),
+        "fileName": dedupe_name,
+        "fileNames": dedupe_file_names,
+        "fileCount": len(dedupe_file_names),
+    }
+    if dedupe_df is not None:
+        inferred_matches = infer_dedupe_matches(source_df.columns, dedupe_df.columns)
+        primary_match = inferred_matches[0] if inferred_matches else {"sourceColumn": None, "hubspotColumn": None, "keyType": None}
+        dedupe_payload.update({
+            "columns": dedupe_df.columns,
+            "totalRows": dedupe_df.height,
+            "sourceRows": int(session.get("dedupeSourceRows") or dedupe_df.height),
+            "sourceMappings": list(session.get("dedupeMapping") or []),
+            "inferredMatch": {
+                "sourceColumn": primary_match.get("sourceColumn"),
+                "hubspotColumn": primary_match.get("hubspotColumn"),
+                "keyType": primary_match.get("keyType"),
+            },
+            "inferredMatches": inferred_matches,
+        })
+
+    payload = {
+        "sessionId": session_id,
+        "fileName": source_name,
+        "fileNames": source_file_names,
+        "fileCount": len(source_file_names),
+        "columns": list(session.get("columns") or []),
+        "columnProfiles": list(session.get("columnProfiles") or []),
+        "previewRows": list(session.get("previewRows") or []),
+        "totalRows": source_df.height,
+        "sourceRows": int(session.get("sourceRows") or source_df.height),
+        "sourceMappings": list(session.get("sourceMapping") or []),
+        "anomalies": dict(session.get("anomalies") or {}),
+        "dedupe": dedupe_payload,
+    }
+    active_run = _serialize_run_snapshot(session.get("activeRun"), include_result=False)
+    if active_run.get("status") != "idle":
+        payload["activeRun"] = active_run
+    return payload
+
+
+def _parse_rules_payload(rules_raw: str) -> list[dict]:
+    try:
+        parsed = json.loads(str(rules_raw or "[]"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid rules payload.") from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=400, detail="Rules payload must be an array.")
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def _build_status_sets_from_rows(rows: list[dict]) -> dict:
+    qualified_ids: set[int] = set()
+    removed_filter_ids: set[int] = set()
+    removed_domain_ids: set[int] = set()
+    removed_hubspot_ids: set[int] = set()
+    removed_filter_reasons: dict[int, str] = {}
+    removed_domain_reasons: dict[int, str] = {}
+
+    for row in rows:
+        row_id = int(row.get("_rowId", -1))
+        if row_id < 0:
+            continue
+        status = str(row.get("_rowStatus") or "")
+        reasons = row.get("_rowReasons") or []
+        if status == "qualified":
+            qualified_ids.add(row_id)
+        elif status == "removed_filter":
+            removed_filter_ids.add(row_id)
+            if reasons:
+                removed_filter_reasons[row_id] = str(reasons[0])
+        elif status == "removed_domain":
+            removed_domain_ids.add(row_id)
+            if reasons:
+                removed_domain_reasons[row_id] = str(reasons[0]).replace("domain_", "")
+        elif status == "removed_hubspot":
+            removed_hubspot_ids.add(row_id)
+
+    return {
+        "qualifiedIds": qualified_ids,
+        "removedFilterIds": removed_filter_ids,
+        "removedFilterReasonById": removed_filter_reasons,
+        "removedDomainIds": removed_domain_ids,
+        "removedHubspotIds": removed_hubspot_ids,
+        "removedDomainReasonById": removed_domain_reasons,
+    }
+
+
+def _serialize_run_snapshot(run: Optional[dict], include_result: bool = True) -> dict:
+    if not isinstance(run, dict):
+        return {
+            "status": "idle",
+            "stage": "idle",
+            "progress": 0.0,
+            "message": "",
+            "processedRows": 0,
+            "totalRows": 0,
+            "qualifiedCount": 0,
+            "removedCount": 0,
+            "removedBreakdown": {
+                "removedFilter": 0,
+                "removedDomain": 0,
+                "removedHubspot": 0,
+            },
+            "completed": True,
+            "error": "",
+        }
+
+    payload = {
+        "runId": run.get("runId"),
+        "status": run.get("status", "idle"),
+        "stage": run.get("stage", "idle"),
+        "progress": float(run.get("progress", 0.0)),
+        "message": run.get("message", ""),
+        "processedRows": int(run.get("processedRows", 0)),
+        "totalRows": int(run.get("totalRows", 0)),
+        "qualifiedCount": int(run.get("qualifiedCount", 0)),
+        "removedCount": int(run.get("removedCount", 0)),
+        "removedBreakdown": run.get("removedBreakdown", {
+            "removedFilter": 0,
+            "removedDomain": 0,
+            "removedHubspot": 0,
+        }),
+        "completed": run.get("status") in ("done", "error"),
+        "error": run.get("error", ""),
+        "startedAt": run.get("startedAt"),
+        "finishedAt": run.get("finishedAt"),
+    }
+    if include_result and run.get("status") == "done" and isinstance(run.get("result"), dict):
+        payload["result"] = run["result"]
+    return payload
+
+
+def _resolve_row_annotation(row_id: int, run_state: Optional[dict]) -> tuple[str, list[str]]:
+    if not isinstance(run_state, dict):
+        return "qualified", ["preview_only"]
+
+    removed_filter_ids = run_state.get("removedFilterIds") or set()
+    removed_domain_ids = run_state.get("removedDomainIds") or set()
+    removed_hubspot_ids = run_state.get("removedHubspotIds") or set()
+    qualified_ids = run_state.get("qualifiedIds") or set()
+    removed_filter_reason_by_id = run_state.get("removedFilterReasonById") or {}
+    removed_domain_reason_by_id = run_state.get("removedDomainReasonById") or {}
+    run_status = str(run_state.get("status") or "idle")
+
+    if row_id in removed_filter_ids:
+        return "removed_filter", [str(removed_filter_reason_by_id.get(row_id, "rule_filter_mismatch"))]
+    if row_id in removed_domain_ids:
+        detail = str(removed_domain_reason_by_id.get(row_id, "unreachable"))
+        return "removed_domain", [f"domain_{detail}".replace("/", "_").replace(" ", "_").replace(":", "_")]
+    if row_id in removed_hubspot_ids:
+        return "removed_hubspot", ["hubspot_duplicate_match"]
+    if row_id in qualified_ids:
+        return "qualified", ["qualified_passed_all_checks"]
+
+    if run_status == "running":
+        return "processing", ["qualification_in_progress"]
+    if run_status == "done":
+        return "removed_filter", ["rule_filter_mismatch"]
+    return "qualified", ["preview_only"]
+
+
+def _domain_result_allows_row(result: Optional[dict]) -> bool:
+    """
+    Domain validation should remove rows for definitive DNS/Geo failures.
+    CDN/cloud and unknown geo states can pass as inconclusive.
+    """
+    if not isinstance(result, dict):
+        return True
+
+    if "is_eligible" in result:
+        return bool(result.get("is_eligible"))
+
+    status = str(result.get("status") or "").strip().lower()
+    if status.startswith("cdn_inconclusive") or status.startswith("geo_inconclusive"):
+        return True
+
+    definitive_dead = {
+        "invalid",
+        "nxdomain",
+        "dns_timeout",
+        "dns_unresolved",
+        "no_a_record",
+        "dns_error",
+        "no_domain",
+        "no domain",
+    }
+    if status.startswith("non_us_country"):
+        return False
+    if status in definitive_dead:
+        return False
+    return bool(result.get("is_alive"))
+
+
+def _domain_result_resolved_ips_csv(result: Optional[dict]) -> str:
+    if not isinstance(result, dict):
+        return ""
+    csv_value = str(result.get("resolved_ips_csv") or "").strip()
+    if csv_value:
+        return csv_value
+    ips = result.get("resolved_ips")
+    if isinstance(ips, list):
+        return ",".join([str(ip).strip() for ip in ips if str(ip).strip()])
+    return ""
+
+
+def _build_resolved_ips_expr(domain_field: str, domain_results: dict) -> pl.Expr:
+    return (
+        pl.col(domain_field)
+        .cast(pl.Utf8)
+        .map_elements(
+            lambda d: _domain_result_resolved_ips_csv(domain_results.get(d, {}))
+            if d and str(d).strip().lower() not in ("unknown", "n/a", "")
+            else "",
+            return_dtype=pl.Utf8,
+        )
+        .alias(RESOLVED_IPS_COLUMN)
+    )
+
+
+def _homepage_signal_value(result: Optional[dict], key: str):
+    if not isinstance(result, dict):
+        return None
+    return result.get(key)
+
+
+def _build_homepage_signal_exprs(domain_field: str, homepage_results: dict) -> list[pl.Expr]:
+    def _map_domain(domain_value: Optional[str], key: str, default):
+        if not domain_value or str(domain_value).strip().lower() in ("unknown", "n/a", ""):
+            return default
+        signal = _homepage_signal_value(homepage_results.get(domain_value, {}), key)
+        if signal is None:
+            return default
+        return signal
+
+    domain_col = pl.col(domain_field).cast(pl.Utf8)
+    return [
+        domain_col.map_elements(
+            lambda d: str(_map_domain(d, "html_lang", "")),
+            return_dtype=pl.Utf8,
+        ).alias(HTML_LANG_COLUMN),
+        domain_col.map_elements(
+            lambda d: str(_map_domain(d, "currency_signals", "none")),
+            return_dtype=pl.Utf8,
+        ).alias(CURRENCY_SIGNALS_COLUMN),
+        domain_col.map_elements(
+            lambda d: str(_map_domain(d, "meta_title", "")),
+            return_dtype=pl.Utf8,
+        ).alias(META_TITLE_COLUMN),
+        domain_col.map_elements(
+            lambda d: str(_map_domain(d, "meta_description", "")),
+            return_dtype=pl.Utf8,
+        ).alias(META_DESCRIPTION_COLUMN),
+        domain_col.map_elements(
+            lambda d: int(_map_domain(d, "b2b_score", 0)),
+            return_dtype=pl.Int64,
+        ).alias(B2B_SCORE_COLUMN),
+        domain_col.map_elements(
+            lambda d: bool(_map_domain(d, "us_signals", False)),
+            return_dtype=pl.Boolean,
+        ).alias(US_SIGNALS_COLUMN),
+        domain_col.map_elements(
+            lambda d: bool(_map_domain(d, "website_keywords_match", False)),
+            return_dtype=pl.Boolean,
+        ).alias(WEBSITE_KEYWORDS_MATCH_COLUMN),
+        domain_col.map_elements(
+            lambda d: str(_map_domain(d, "homepage_status", "inconclusive:missing_homepage_signals")),
+            return_dtype=pl.Utf8,
+        ).alias(HOMEPAGE_STATUS_COLUMN),
+    ]
+
+
+def _homepage_result_allows_row(result: Optional[dict]) -> bool:
+    if not isinstance(result, dict) or not result:
+        return True
+    status = str(result.get("homepage_status") or "").lower()
+    if status.startswith("inconclusive:"):
+        return True
+    if status.startswith("disqualified:fetch_failed"):
+        return True
+    if status in ("", "unknown", "not_checked"):
+        return True
+    if "homepage_disqualified" in result:
+        return not bool(result.get("homepage_disqualified"))
+    if status.startswith("disqualified"):
+        return False
+    return True
+
+
+def _parse_form_bool(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_tld_token(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    raw = raw.replace("*.", "")
+    raw = raw.strip(".")
+    raw = re.sub(r"[^a-z0-9.-]", "", raw)
+    if not raw:
+        return ""
+    return f".{raw}"
+
+
+def _parse_tld_list_payload(payload: Optional[str]) -> set[str]:
+    """
+    Accept JSON arrays or comma/newline-separated strings of TLD suffixes.
+    Returns canonical tokens like ".co.uk" or ".com".
+    """
+    raw = str(payload or "").strip()
+    if not raw:
+        return set()
+
+    items: list[str]
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            items = [str(v) for v in parsed]
+        elif isinstance(parsed, str):
+            items = re.split(r"[\s,]+", parsed)
+        else:
+            items = [raw]
+    except Exception:
+        items = re.split(r"[\s,]+", raw)
+
+    out = set()
+    for item in items:
+        token = _normalize_tld_token(item)
+        if token:
+            out.add(token)
+    return out
+
+
+def _parse_website_keywords_payload(payload: Optional[str]) -> list[str]:
+    raw = str(payload or "").strip()
+    if not raw:
+        return []
+
+    values: list[str]
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            values = [str(v) for v in parsed]
+        elif isinstance(parsed, str):
+            values = re.split(r"[\n,]+", parsed)
+        else:
+            values = [raw]
+    except Exception:
+        values = re.split(r"[\n,]+", raw)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        token = str(value or "").strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def _parse_export_columns_payload(payload: Optional[str]) -> list[str]:
+    raw = str(payload or "").strip()
+    if not raw:
+        return []
+
+    values: list[str]
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            values = [str(v) for v in parsed]
+        elif isinstance(parsed, str):
+            values = re.split(r"[\n,]+", parsed)
+        else:
+            values = [raw]
+    except Exception:
+        values = re.split(r"[\n,]+", raw)
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        token = str(value or "").strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        selected.append(token)
+    return selected
+
+
+def _apply_export_column_selection(df: pl.DataFrame, selected_columns: list[str]) -> pl.DataFrame:
+    if not isinstance(df, pl.DataFrame):
+        return df
+    if not selected_columns:
+        return df
+
+    keep = [col for col in selected_columns if col in df.columns]
+    if not keep:
+        return df.select([])
+    return df.select(keep)
+
+
+def normalize_domain(d: str) -> str:
+    """Strip protocol, www., trailing slash from a domain string."""
+    if not d or not isinstance(d, str):
+        return ""
+    d = d.strip().lower()
+    for prefix in ("https://", "http://", "www."):
+        if d.startswith(prefix):
+            d = d[len(prefix):]
+    return d.rstrip("/").strip()
+
+
+def _extract_domain_host(value: Optional[str]) -> str:
+    clean = normalize_domain(str(value or ""))
+    if not clean:
+        return ""
+    host = clean.split("/", 1)[0].split(":", 1)[0].strip().lower().strip(".")
+    return host
+
+
+def _host_matches_tld(host: str, tld: str) -> bool:
+    suffix = str(tld or "").strip().lower().lstrip(".")
+    if not suffix or not host:
+        return False
+    return host == suffix or host.endswith(f".{suffix}")
+
+
+def _match_tld_suffix(host: str, tlds: set[str]) -> Optional[str]:
+    for token in sorted(tlds, key=len, reverse=True):
+        if _host_matches_tld(host, token):
+            return token
+    return None
+
+
+def _is_country_code_root(host: str) -> bool:
+    if not host or "." not in host:
+        return False
+    root = host.split(".")[-1]
+    return len(root) == 2 and root.isalpha()
+
+
+def _evaluate_tld_filter(
+    domain_value: Optional[str],
+    disallowed_tlds: set[str],
+    allowed_tlds: set[str],
+    exclude_country_tlds: bool,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    host = _extract_domain_host(domain_value)
+    if not host:
+        return True, None, None
+
+    matched_allow = _match_tld_suffix(host, allowed_tlds)
+    if matched_allow:
+        return True, None, None
+
+    matched_disallow = _match_tld_suffix(host, disallowed_tlds)
+    if matched_disallow:
+        code = f"disallowed_tld_{matched_disallow.lstrip('.').replace('.', '_')}"
+        status = f"disallowed tld ({matched_disallow})"
+        return False, code, status
+
+    if exclude_country_tlds and _is_country_code_root(host):
+        root_tld = f".{host.split('.')[-1]}"
+        code = f"disallowed_tld_{root_tld.lstrip('.')}"
+        status = f"disallowed tld ({root_tld})"
+        return False, code, status
+
+    return True, None, None
+
+
+def _apply_domain_tld_filter(
+    df: pl.DataFrame,
+    domain_field: str,
+    disallowed_tlds: set[str],
+    allowed_tlds: set[str],
+    exclude_country_tlds: bool,
+) -> tuple[pl.DataFrame, int, int, list[dict], dict[int, str]]:
+    """
+    Apply TLD-based filtering and return:
+    (filtered_df, removed_count, checked_domains_count, dead_domains, reasons_by_row_id)
+    """
+    if df.height == 0 or domain_field not in df.columns:
+        return df, 0, 0, [], {}
+
+    domain_values = df[domain_field].cast(pl.Utf8).to_list()
+    unique_domains = {
+        d for d in domain_values
+        if d and str(d).strip().lower() not in ("unknown", "n/a", "")
+    }
+
+    decision_by_domain: dict[str, tuple[bool, Optional[str], Optional[str]]] = {}
+    for domain in unique_domains:
+        decision_by_domain[domain] = _evaluate_tld_filter(
+            domain_value=domain,
+            disallowed_tlds=disallowed_tlds,
+            allowed_tlds=allowed_tlds,
+            exclude_country_tlds=exclude_country_tlds,
+        )
+
+    keep_mask = (
+        df[domain_field]
+        .cast(pl.Utf8)
+        .map_elements(
+            lambda d: decision_by_domain.get(d, (True, None, None))[0]
+            if d and str(d).strip().lower() not in ("unknown", "n/a", "")
+            else True,
+            return_dtype=pl.Boolean,
+        )
+    )
+
+    filtered = df.filter(keep_mask)
+    removed_count = df.height - filtered.height
+    if removed_count <= 0:
+        return filtered, 0, len(unique_domains), [], {}
+
+    dead_domains = []
+    for domain, (allowed, _, status) in decision_by_domain.items():
+        if not allowed:
+            dead_domains.append({"domain": domain, "status": status or "disallowed tld"})
+
+    reasons_by_row_id: dict[int, str] = {}
+    removed_rows = df.filter(~keep_mask).select(["__row_id", domain_field]).to_dicts()
+    for item in removed_rows:
+        domain_value = item.get(domain_field)
+        _, code, _ = decision_by_domain.get(domain_value, (False, "disallowed_tld", None))
+        reasons_by_row_id[int(item["__row_id"])] = str(code or "disallowed_tld")
+
+    return filtered, removed_count, len(unique_domains), dead_domains, reasons_by_row_id
+
+
+def normalize_company_text(value: str) -> str:
+    """Normalize company-like text for duplicate detection."""
+    if not value:
+        return ""
+    cleaned = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def normalize_link(value: str) -> str:
+    """Legacy link normalization kept for compatibility."""
+    if not value:
+        return ""
+    raw = str(value).strip().lower()
+    raw = raw.replace("https://", "").replace("http://", "").replace("www.", "")
+    return raw.rstrip("/").strip()
+
+
+def normalize_domain_key(value: str) -> str:
+    """Normalize domain/website-like values into canonical host."""
+    if not value:
+        return ""
+    raw = str(value).strip().lower()
+    if not raw or " " in raw:
+        return ""
+
+    # If protocol is missing, urlsplit treats host as path.
+    candidate = raw if re.match(r"^[a-z][a-z0-9+.-]*://", raw) else f"http://{raw}"
+    try:
+        parsed = urlsplit(candidate)
+    except Exception:
+        cleaned = raw.replace("https://", "").replace("http://", "").replace("www.", "")
+        cleaned = cleaned.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].split(":", 1)[0].strip(".")
+        return cleaned
+    host = (parsed.netloc or parsed.path or "").strip().lower()
+    if not host:
+        return ""
+    host = host.split("/", 1)[0].split("@")[-1].split(":", 1)[0].strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def normalize_linkedin_key(value: str) -> str:
+    """Normalize linkedin URLs/handles while preserving profile path."""
+    if not value:
+        return ""
+    raw = str(value).strip().lower()
+    if not raw:
+        return ""
+
+    # Handles like @companyname
+    if raw.startswith("@"):
+        return raw.lstrip("@").strip()
+
+    if " " in raw and "linkedin" not in raw:
+        return ""
+    if "linkedin" not in raw and "/" not in raw and "." not in raw:
+        # likely plain linkedin handle (without @)
+        return raw
+
+    candidate = raw if re.match(r"^[a-z][a-z0-9+.-]*://", raw) else f"https://{raw}"
+    try:
+        parsed = urlsplit(candidate)
+    except Exception:
+        cleaned = raw.replace("https://", "").replace("http://", "").replace("www.", "")
+        cleaned = cleaned.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        return cleaned if "linkedin" in cleaned else ""
+    host = (parsed.netloc or "").strip().lower()
+    path = (parsed.path or "").strip().lower()
+
+    if host.startswith("www."):
+        host = host[4:]
+
+    if not host:
+        # fallback for non-URL values
+        cleaned = raw.replace("https://", "").replace("http://", "").replace("www.", "")
+        return cleaned.rstrip("/").strip()
+
+    if host.endswith("linkedin.com"):
+        path = path.rstrip("/")
+        return f"{host}{path}" if path else host
+    return f"{host}{path}".rstrip("/")
+
+
+def _split_multivalue_tokens(value: str) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    parts = [part.strip() for part in re.split(r"[,\n;|]+", raw) if part and str(part).strip()]
+    return parts if len(parts) > 1 else [raw]
+
+
+def _extract_normalized_keys(value: str, key_class: str) -> list[str]:
+    tokens = _split_multivalue_tokens(value) if key_class in ("domain", "linkedin") else [str(value or "")]
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if key_class == "domain":
+            key = normalize_domain_key(token)
+        elif key_class == "linkedin":
+            key = normalize_linkedin_key(token)
+        else:
+            key = normalize_company_text(token)
+        if not key or key in seen or key in {"unknown", "n/a", "none", "null"}:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def guess_key_column(columns: list[str], preferred_class: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    """
+    Guess best key column and key class.
+    Key classes: domain, linkedin, company.
+    """
+    class_hints = {
+        "domain": ["domain", "website", "url", "site", "homepage", "web"],
+        "linkedin": ["linkedin", "li url", "li", "linkedin url"],
+        "company": ["company", "account", "organization", "org", "name"],
+    }
+
+    def find_for_class(key_class: str) -> Optional[str]:
+        hints = class_hints[key_class]
+        for hint in hints:
+            for col in columns:
+                if hint in col.lower():
+                    return col
+        return None
+
+    if preferred_class:
+        preferred = find_for_class(preferred_class)
+        if preferred:
+            return preferred, preferred_class
+
+    for key_class in ("domain", "linkedin", "company"):
+        found = find_for_class(key_class)
+        if found:
+            return found, key_class
+    return None, None
+
+
+def guess_key_columns(columns: list[str]) -> dict[str, list[str]]:
+    """Return candidate key columns by class using lightweight heuristics."""
+    class_hints = {
+        "domain": ["domain", "website", "url", "homepage"],
+        "linkedin": ["linkedin", "li url", "linkedin url"],
+        "company": ["company", "account", "organization", "org", "name"],
+    }
+    company_exclusions = (
+        " id",
+        "ids",
+        "owner",
+        "associated",
+        "parent",
+        "child",
+        "deal",
+        "ticket",
+        "contact",
+        "project",
+        "quote",
+        "task",
+        "lead",
+        "campaign",
+        "source",
+        "record",
+        "date",
+        "time",
+        "number of",
+        "count",
+        "industry",
+        "keyword",
+        "domain",
+        "url",
+        "facebook",
+        "linkedin",
+        "twitter",
+        "revenue",
+        "employee",
+        "country",
+        "state",
+        "city",
+        "postal",
+        "phone",
+        "address",
+    )
+    domain_exclusions = ("logo", "technolog", "pagerank", "page rank", "tranco", "umbrella")
+    out: dict[str, list[str]] = {"domain": [], "linkedin": [], "company": []}
+    for key_class, hints in class_hints.items():
+        for col in columns:
+            col_lower = col.lower()
+            if key_class == "domain" and "linkedin" in col_lower:
+                continue
+            if key_class == "domain" and any(token in col_lower for token in domain_exclusions):
+                continue
+            if key_class == "linkedin" and not (
+                "linkedin" in col_lower or "li url" in col_lower
+            ):
+                continue
+            if key_class == "company" and any(token in col_lower for token in ("first name", "last name", "fullname", "full name")):
+                continue
+            if key_class == "company" and any(token in col_lower for token in company_exclusions):
+                continue
+            if any(hint in col_lower for hint in hints):
+                out[key_class].append(col)
+    return out
+
+
+def infer_dedupe_matches(source_columns: list[str], dedupe_columns: list[str]) -> list[dict]:
+    """Infer how source keys can be compared against dedupe keys across key types."""
+    source_by_class = guess_key_columns(source_columns)
+    dedupe_by_class = guess_key_columns(dedupe_columns)
+    matches: list[dict] = []
+    for key_type in ("domain", "linkedin", "company"):
+        source_candidates = source_by_class.get(key_type) or []
+        source_col = source_candidates[0] if source_candidates else None
+        hubspot_cols = dedupe_by_class.get(key_type, [])
+        if source_col and hubspot_cols:
+            matches.append({
+                "keyType": key_type,
+                "sourceColumn": source_col,
+                "sourceColumns": source_candidates,
+                "hubspotColumn": hubspot_cols[0],
+                "hubspotColumns": hubspot_cols,
+            })
+    return matches
+
+
+def build_dedupe_key_set(df: pl.DataFrame, column_name: str, key_class: str) -> set[str]:
+    """Build normalized comparison keys from a dataframe column."""
+    if not column_name or column_name not in df.columns:
+        return set()
+
+    values = df[column_name].cast(pl.Utf8).drop_nulls().to_list()
+    out = set()
+    for value in values:
+        for key in _extract_normalized_keys(value, key_class):
+            out.add(key)
+    return out
+
+
+def apply_hubspot_dedupe(
+    qualified: pl.DataFrame,
+    dedupe_raw: Optional[bytes] = None,
+    dedupe_df: Optional[pl.DataFrame] = None,
+) -> tuple[pl.DataFrame, dict]:
+    """
+    Remove rows from `qualified` that already exist in the HubSpot CSV.
+    Returns updated df and metadata.
+    """
+    info = {
+        "enabled": False,
+        "removedCount": 0,
+        "checkedCount": 0,
+        "candidateColumn": None,
+        "hubspotColumn": None,
+        "keyType": None,
+        "matches": [],
+        "warnings": [],
+    }
+    if not dedupe_raw and dedupe_df is None:
+        return qualified, info
+
+    info["enabled"] = True
+    hubspot_df = dedupe_df if dedupe_df is not None else read_csv_bytes(dedupe_raw or b"")
+    if qualified.height == 0 or hubspot_df.height == 0:
+        return qualified, info
+
+    inferred_matches = infer_dedupe_matches(qualified.columns, hubspot_df.columns)
+    if not inferred_matches:
+        info["warnings"].append("Could not infer matching columns for HubSpot dedupe.")
+        return qualified, info
+
+    info["checkedCount"] = qualified.height
+
+    masks: list[pl.Series] = []
+    active_matches: list[dict] = []
+    for match in inferred_matches:
+        key_class = str(match.get("keyType") or "")
+        source_cols = [str(col) for col in (match.get("sourceColumns") or []) if str(col).strip() and str(col) in qualified.columns]
+        if not source_cols:
+            source_col = str(match.get("sourceColumn") or "")
+            if source_col and source_col in qualified.columns:
+                source_cols = [source_col]
+        hubspot_cols = [str(col) for col in (match.get("hubspotColumns") or []) if str(col).strip()]
+        if not key_class or not source_cols or not hubspot_cols:
+            continue
+
+        reference_keys: set[str] = set()
+        for hubspot_col in hubspot_cols:
+            reference_keys.update(build_dedupe_key_set(hubspot_df, hubspot_col, key_class))
+        if not reference_keys:
+            continue
+
+        class_mask: Optional[pl.Series] = None
+        for source_col in source_cols:
+            candidate_series = qualified[source_col].cast(pl.Utf8)
+            col_mask = candidate_series.map_elements(
+                lambda value: not any(key in reference_keys for key in _extract_normalized_keys(value, key_class)),
+                return_dtype=pl.Boolean,
+            )
+            class_mask = col_mask if class_mask is None else (class_mask & col_mask)
+        if class_mask is None:
+            continue
+
+        masks.append(class_mask)
+        active_matches.append({
+            "keyType": key_class,
+            "sourceColumn": source_cols[0],
+            "sourceColumns": source_cols,
+            "hubspotColumn": hubspot_cols[0],
+            "hubspotColumns": hubspot_cols,
+            "referenceCount": len(reference_keys),
+        })
+
+    if not masks:
+        info["warnings"].append("HubSpot dedupe files had no usable key values.")
+        return qualified, info
+
+    keep_mask = masks[0]
+    for mask in masks[1:]:
+        keep_mask = keep_mask & mask
+
+    deduped = qualified.filter(keep_mask)
+    info["removedCount"] = qualified.height - deduped.height
+    info["matches"] = active_matches
+    if active_matches:
+        first_match = active_matches[0]
+        info["candidateColumn"] = first_match.get("sourceColumn")
+        info["hubspotColumn"] = first_match.get("hubspotColumn")
+        info["keyType"] = first_match.get("keyType")
+    return deduped, info
+
+
+async def run_qualification_pipeline(
+    df: pl.DataFrame,
+    parsed_rules: list[dict],
+    domain_check: bool,
+    homepage_check: bool,
+    domain_field: str,
+    website_keywords: list[str],
+    exclude_country_tlds: bool,
+    disallowed_tlds: set[str],
+    allowed_tlds: set[str],
+    dedupe_raw: Optional[bytes],
+    dedupe_df: Optional[pl.DataFrame] = None,
+    include_rows: bool = True,
+    include_leads: bool = True,
+    include_dataframe: bool = False,
+) -> dict:
+    """
+    Execute filters, domain verification, and dedupe with status tracking.
+    Returns output payload parts used by legacy and session endpoints.
+    """
+    df_with_id = df.with_row_count("__row_id")
+    warnings = []
+
+    # Rule filtering stage
+    after_filters, removed_filter_reason_by_id = apply_rules_with_trace(df_with_id, parsed_rules)
+    removed_filter_count = df_with_id.height - after_filters.height
+    removed_filter_ids: set[int] = set()
+    if include_rows:
+        all_ids = set(df_with_id["__row_id"].to_list())
+        after_filter_ids = set(after_filters["__row_id"].to_list())
+        removed_filter_ids = all_ids - after_filter_ids
+
+    # Domain + homepage stage
+    working = after_filters
+    domain_results = {}
+    homepage_results = {}
+    dead_domains = []
+    domain_checked_count = 0
+    homepage_checked_count = 0
+    removed_domain_count = 0
+    removed_domain_ids = set()
+    removed_domain_reason_by_id: dict[int, str] = {}
+    tld_filter_enabled = bool(exclude_country_tlds or disallowed_tlds)
+
+    if (domain_check or homepage_check or tld_filter_enabled) and domain_field and domain_field in working.columns:
+        if tld_filter_enabled:
+            pre_tld = working
+            (
+                working,
+                tld_removed_count,
+                tld_checked_count,
+                tld_dead_domains,
+                tld_reason_by_row_id,
+            ) = _apply_domain_tld_filter(
+                df=pre_tld,
+                domain_field=domain_field,
+                disallowed_tlds=disallowed_tlds,
+                allowed_tlds=allowed_tlds,
+                exclude_country_tlds=exclude_country_tlds,
+            )
+            removed_domain_count += tld_removed_count
+            domain_checked_count += tld_checked_count
+            dead_domains.extend(tld_dead_domains)
+            if include_rows and tld_removed_count > 0:
+                removed_domain_ids.update(tld_reason_by_row_id.keys())
+                removed_domain_reason_by_id.update(tld_reason_by_row_id)
+
+        if domain_check:
+            domains = working[domain_field].cast(pl.Utf8).to_list()
+            unique_domains = list(set(d for d in domains if d and d.lower() not in ("unknown", "n/a", "")))
+            if tld_filter_enabled:
+                domain_checked_count = max(domain_checked_count, len(unique_domains))
+            else:
+                domain_checked_count += len(unique_domains)
+            # Use DNS-based validation instead of HTTP (28-42x faster)
+            domain_results = await check_domains_dns_batch(unique_domains, concurrency=800)
+
+            resolved_ips_expr = _build_resolved_ips_expr(domain_field, domain_results)
+            pre_domain = working.with_columns(resolved_ips_expr)
+            df_with_id = df_with_id.with_columns(resolved_ips_expr)
+            alive_mask = (
+                pre_domain[domain_field]
+                .cast(pl.Utf8)
+                .map_elements(
+                    lambda d: _domain_result_allows_row(domain_results.get(d, {}))
+                    if d and d.lower() not in ("unknown", "n/a", "")
+                    else False,
+                    return_dtype=pl.Boolean,
+                )
+            )
+            working = pre_domain.filter(alive_mask)
+            removed_domain_count += pre_domain.height - working.height
+            if include_rows:
+                post_domain_ids = set(working["__row_id"].to_list())
+                dns_removed_ids = set(pre_domain["__row_id"].to_list()) - post_domain_ids
+                removed_domain_ids.update(dns_removed_ids)
+
+            dead_domains.extend([
+                {"domain": d, "status": domain_results.get(d, {}).get("status", "unknown")}
+                for d in unique_domains
+                if not _domain_result_allows_row(domain_results.get(d, {}))
+            ])
+
+            if include_rows:
+                # Row-id -> reason detail mapping for inspector UX
+                removed_rows = pre_domain.filter(~alive_mask).select(["__row_id", domain_field]).to_dicts()
+                for item in removed_rows:
+                    status = domain_results.get(item.get(domain_field), {}).get("status", "unreachable")
+                    removed_domain_reason_by_id[int(item["__row_id"])] = status
+
+        if homepage_check:
+            homepage_domains = list(set(
+                d for d in working[domain_field].cast(pl.Utf8).to_list()
+                if d and d.lower() not in ("unknown", "n/a", "")
+            ))
+            homepage_checked_count = len(homepage_domains)
+            if homepage_domains:
+                homepage_results = await collect_homepage_signals_batch(
+                    homepage_domains,
+                    website_keywords=website_keywords,
+                    concurrency=80,
+                )
+            homepage_exprs = _build_homepage_signal_exprs(domain_field, homepage_results)
+            pre_homepage = working.with_columns(homepage_exprs)
+            df_with_id = df_with_id.with_columns(homepage_exprs)
+            homepage_mask = (
+                pre_homepage[domain_field]
+                .cast(pl.Utf8)
+                .map_elements(
+                    lambda d: _homepage_result_allows_row(homepage_results.get(d, {}))
+                    if d and d.lower() not in ("unknown", "n/a", "")
+                    else False,
+                    return_dtype=pl.Boolean,
+                )
+            )
+            working = pre_homepage.filter(homepage_mask)
+            removed_domain_count += pre_homepage.height - working.height
+            if include_rows:
+                post_homepage_ids = set(working["__row_id"].to_list())
+                homepage_removed_ids = set(pre_homepage["__row_id"].to_list()) - post_homepage_ids
+                removed_domain_ids.update(homepage_removed_ids)
+
+                removed_rows = pre_homepage.filter(~homepage_mask).select(["__row_id", domain_field]).to_dicts()
+                for item in removed_rows:
+                    status = homepage_results.get(item.get(domain_field), {}).get("homepage_status", "homepage_disqualified")
+                    removed_domain_reason_by_id[int(item["__row_id"])] = status
+
+            dead_domains.extend([
+                {"domain": d, "status": homepage_results.get(d, {}).get("homepage_status", "homepage_disqualified")}
+                for d in homepage_domains
+                if not _homepage_result_allows_row(homepage_results.get(d, {}))
+            ])
+    elif domain_check or homepage_check or tld_filter_enabled:
+        warnings.append(
+            "Domain verification, homepage checks, or TLD filtering was enabled, but the selected website column was unavailable."
+        )
+
+    # HubSpot dedupe stage
+    pre_dedupe_count = working.height
+    deduped, dedupe_info = apply_hubspot_dedupe(working, dedupe_raw=dedupe_raw, dedupe_df=dedupe_df)
+    warnings.extend(dedupe_info.get("warnings", []))
+    removed_hubspot_count = pre_dedupe_count - deduped.height
+    qualified_ids: set[int] = set()
+    removed_hubspot_ids: set[int] = set()
+    if include_rows:
+        pre_dedupe_ids = set(working["__row_id"].to_list())
+        qualified_ids = set(deduped["__row_id"].to_list())
+        removed_hubspot_ids = pre_dedupe_ids - qualified_ids
+
+    # Build row-level status taxonomy and reasons
+    rows = []
+    if include_rows:
+        for row in df_with_id.to_dicts():
+            row_id = int(row.pop("__row_id"))
+            if row_id in qualified_ids:
+                row_status = "qualified"
+                row_reasons = ["qualified_passed_all_checks"]
+            elif row_id in removed_filter_ids:
+                row_status = "removed_filter"
+                row_reasons = [str(removed_filter_reason_by_id.get(row_id, "rule_filter_mismatch"))]
+            elif row_id in removed_domain_ids:
+                row_status = "removed_domain"
+                domain_detail = removed_domain_reason_by_id.get(row_id, "unreachable")
+                row_reasons = [f"domain_{domain_detail}".replace("/", "_").replace(" ", "_").replace(":", "_")]
+            elif row_id in removed_hubspot_ids:
+                row_status = "removed_hubspot"
+                row_reasons = ["hubspot_duplicate_match"]
+            else:
+                row_status = "removed_filter"
+                row_reasons = [str(removed_filter_reason_by_id.get(row_id, "rule_filter_mismatch"))]
+
+            rows.append({
+                **row,
+                "_rowId": row_id,
+                "_rowStatus": row_status,
+                "_rowReasons": row_reasons,
+            })
+
+    qualified_for_return = deduped.drop("__row_id")
+    output_columns = [col for col in df_with_id.columns if col != "__row_id"]
+    removed_breakdown = {
+        "removedFilter": removed_filter_count,
+        "removedDomain": removed_domain_count,
+        "removedHubspot": removed_hubspot_count,
+    }
+
+    return {
+        "rows": rows,
+        "leads": qualified_for_return.to_dicts() if include_leads else [],
+        "qualifiedDf": qualified_for_return if include_dataframe else None,
+        "columns": output_columns,
+        "qualifiedCount": qualified_for_return.height,
+        "removedCount": df.height - qualified_for_return.height,
+        "removedBreakdown": removed_breakdown,
+        "domainResults": {
+            "checked": domain_checked_count,
+            "homepageChecked": homepage_checked_count,
+            "dead": dead_domains,
+            "cdnReference": get_cdn_reference_data(),
+        },
+        "dedupeInfo": dedupe_info,
+        "warnings": warnings,
+    }
+
+
+async def _run_session_qualification_job(
+    session_id: str,
+    run_id: str,
+    parsed_rules: list[dict],
+    domain_check: bool,
+    homepage_check: bool,
+    domain_field: str,
+    website_keywords: list[str],
+    exclude_country_tlds: bool,
+    disallowed_tlds: set[str],
+    allowed_tlds: set[str],
+) -> None:
+    start_time = time.perf_counter()
+
+    def _get_current_run() -> tuple[Optional[dict], Optional[dict]]:
+        session = SESSION_STORE.get(session_id)
+        if not session:
+            return None, None
+        run = session.get("activeRun")
+        if not isinstance(run, dict) or run.get("runId") != run_id:
+            return session, None
+        return session, run
+
+    def _update_run(**kwargs) -> bool:
+        session, run = _get_current_run()
+        if not session or not run:
+            return False
+        run.update(kwargs)
+        session["updatedAt"] = time.time()
+        return True
+
+    try:
+        session = _touch_session(session_id)
+        df = _get_session_df(session)
+        dedupe_df = _get_session_dedupe_df(session)
+        total_rows = df.height
+        _update_run(
+            stage="filters",
+            progress=0.08,
+            message="Applying qualification filters...",
+            processedRows=0,
+            totalRows=total_rows,
+        )
+
+        df_with_id = df.with_row_count("__row_id")
+        all_ids = set(df_with_id["__row_id"].to_list())
+        warnings: list[str] = []
+
+        after_filters, removed_filter_reason_by_id = apply_rules_with_trace(df_with_id, parsed_rules)
+        after_filter_ids = set(after_filters["__row_id"].to_list())
+        removed_filter_ids = all_ids - after_filter_ids
+        removed_filter_count = len(removed_filter_ids)
+
+        _update_run(
+            stage="filters",
+            progress=0.32,
+            message="Filters applied.",
+            removedFilterIds=removed_filter_ids,
+            removedFilterReasonById=removed_filter_reason_by_id,
+            qualifiedIds=after_filter_ids,
+            removedBreakdown={
+                "removedFilter": removed_filter_count,
+                "removedDomain": 0,
+                "removedHubspot": 0,
+            },
+            qualifiedCount=len(after_filter_ids),
+            removedCount=removed_filter_count,
+            processedRows=removed_filter_count,
+        )
+
+        working = after_filters
+        domain_results = {}
+        homepage_results = {}
+        dead_domains = []
+        domain_checked_count = 0
+        homepage_checked_count = 0
+        removed_domain_count = 0
+        removed_domain_ids: set[int] = set()
+        removed_domain_reason_by_id: dict[int, str] = {}
+        tld_filter_enabled = bool(exclude_country_tlds or disallowed_tlds)
+
+        if (domain_check or homepage_check or tld_filter_enabled) and domain_field and domain_field in working.columns:
+            if tld_filter_enabled:
+                _update_run(
+                    stage="domain",
+                    progress=0.36,
+                    message="Applying TLD filters...",
+                )
+                pre_tld = working
+                (
+                    working,
+                    tld_removed_count,
+                    tld_checked_count,
+                    tld_dead_domains,
+                    tld_reason_by_row_id,
+                ) = _apply_domain_tld_filter(
+                    df=pre_tld,
+                    domain_field=domain_field,
+                    disallowed_tlds=disallowed_tlds,
+                    allowed_tlds=allowed_tlds,
+                    exclude_country_tlds=exclude_country_tlds,
+                )
+                removed_domain_count += tld_removed_count
+                domain_checked_count += tld_checked_count
+                dead_domains.extend(tld_dead_domains)
+                if tld_removed_count > 0:
+                    removed_domain_ids.update(tld_reason_by_row_id.keys())
+                    removed_domain_reason_by_id.update(tld_reason_by_row_id)
+
+            if domain_check:
+                unique_domains = list(set(
+                    d for d in working[domain_field].cast(pl.Utf8).to_list()
+                    if d and d.lower() not in ("unknown", "n/a", "")
+                ))
+                if tld_filter_enabled:
+                    domain_checked_count = max(domain_checked_count, len(unique_domains))
+                else:
+                    domain_checked_count += len(unique_domains)
+
+                _update_run(
+                    stage="domain",
+                    progress=0.44 if tld_filter_enabled else 0.36,
+                    message=f"Validating domains (0/{len(unique_domains)})...",
+                )
+
+                def _on_domain_progress(processed: int, total: int) -> None:
+                    total_safe = max(total, 1)
+                    stage_progress = min(processed / total_safe, 1.0)
+                    _update_run(
+                        stage="domain",
+                        progress=0.44 + (0.28 * stage_progress) if tld_filter_enabled else 0.36 + (0.36 * stage_progress),
+                        message=f"Validating domains ({processed}/{total})...",
+                    )
+
+                domain_results = await check_domains_dns_batch(
+                    unique_domains,
+                    concurrency=800,
+                    progress_callback=_on_domain_progress,
+                )
+
+                resolved_ips_expr = _build_resolved_ips_expr(domain_field, domain_results)
+                pre_domain = working.with_columns(resolved_ips_expr)
+                df_with_id = df_with_id.with_columns(resolved_ips_expr)
+                alive_mask = (
+                    pre_domain[domain_field]
+                    .cast(pl.Utf8)
+                    .map_elements(
+                        lambda d: _domain_result_allows_row(domain_results.get(d, {}))
+                        if d and d.lower() not in ("unknown", "n/a", "")
+                        else False,
+                        return_dtype=pl.Boolean,
+                    )
+                )
+                working = pre_domain.filter(alive_mask)
+                removed_domain_count += pre_domain.height - working.height
+
+                post_domain_ids = set(working["__row_id"].to_list())
+                dns_removed_ids = set(pre_domain["__row_id"].to_list()) - post_domain_ids
+                removed_domain_ids.update(dns_removed_ids)
+
+                dead_domains.extend([
+                    {"domain": d, "status": domain_results.get(d, {}).get("status", "unknown")}
+                    for d in unique_domains
+                    if not _domain_result_allows_row(domain_results.get(d, {}))
+                ])
+
+                removed_rows = pre_domain.filter(~alive_mask).select(["__row_id", domain_field]).to_dicts()
+                for item in removed_rows:
+                    status = domain_results.get(item.get(domain_field), {}).get("status", "unreachable")
+                    removed_domain_reason_by_id[int(item["__row_id"])] = status
+
+            if homepage_check:
+                homepage_domains = list(set(
+                    d for d in working[domain_field].cast(pl.Utf8).to_list()
+                    if d and d.lower() not in ("unknown", "n/a", "")
+                ))
+                homepage_checked_count = len(homepage_domains)
+
+                _update_run(
+                    stage="homepage",
+                    progress=0.73,
+                    message=f"Scraping homepages (0/{homepage_checked_count})...",
+                )
+
+                def _on_homepage_progress(processed: int, total: int) -> None:
+                    total_safe = max(total, 1)
+                    stage_progress = min(processed / total_safe, 1.0)
+                    _update_run(
+                        stage="homepage",
+                        progress=0.73 + (0.12 * stage_progress),
+                        message=f"Scraping homepages ({processed}/{total})...",
+                    )
+
+                if homepage_domains:
+                    homepage_results = await collect_homepage_signals_batch(
+                        homepage_domains,
+                        website_keywords=website_keywords,
+                        concurrency=80,
+                        progress_callback=_on_homepage_progress,
+                    )
+
+                homepage_exprs = _build_homepage_signal_exprs(domain_field, homepage_results)
+                pre_homepage = working.with_columns(homepage_exprs)
+                df_with_id = df_with_id.with_columns(homepage_exprs)
+                homepage_mask = (
+                    pre_homepage[domain_field]
+                    .cast(pl.Utf8)
+                    .map_elements(
+                        lambda d: _homepage_result_allows_row(homepage_results.get(d, {}))
+                        if d and d.lower() not in ("unknown", "n/a", "")
+                        else False,
+                        return_dtype=pl.Boolean,
+                    )
+                )
+                working = pre_homepage.filter(homepage_mask)
+                removed_domain_count += pre_homepage.height - working.height
+
+                post_homepage_ids = set(working["__row_id"].to_list())
+                homepage_removed_ids = set(pre_homepage["__row_id"].to_list()) - post_homepage_ids
+                removed_domain_ids.update(homepage_removed_ids)
+
+                removed_rows = pre_homepage.filter(~homepage_mask).select(["__row_id", domain_field]).to_dicts()
+                for item in removed_rows:
+                    status = homepage_results.get(item.get(domain_field), {}).get("homepage_status", "homepage_disqualified")
+                    removed_domain_reason_by_id[int(item["__row_id"])] = status
+
+                dead_domains.extend([
+                    {"domain": d, "status": homepage_results.get(d, {}).get("homepage_status", "homepage_disqualified")}
+                    for d in homepage_domains
+                    if not _homepage_result_allows_row(homepage_results.get(d, {}))
+                ])
+        elif domain_check or homepage_check or tld_filter_enabled:
+            warnings.append(
+                "Domain verification, homepage checks, or TLD filtering was enabled, but the selected website column was unavailable."
+            )
+
+        _update_run(
+            stage="website_checks",
+            progress=0.85 if homepage_check else 0.72,
+            message="Domain and homepage checks complete." if homepage_check else "Domain checks complete.",
+            qualifiedIds=set(working["__row_id"].to_list()),
+            removedDomainIds=removed_domain_ids,
+            removedDomainReasonById=removed_domain_reason_by_id,
+            removedBreakdown={
+                "removedFilter": removed_filter_count,
+                "removedDomain": removed_domain_count,
+                "removedHubspot": 0,
+            },
+            qualifiedCount=working.height,
+            removedCount=removed_filter_count + removed_domain_count,
+        )
+
+        _update_run(
+            stage="dedupe",
+            progress=0.89 if homepage_check else 0.78,
+            message="Applying duplicate guard...",
+        )
+
+        pre_dedupe_count = working.height
+        deduped, dedupe_info = apply_hubspot_dedupe(working, dedupe_raw=session.get("dedupeRaw"), dedupe_df=dedupe_df)
+        warnings.extend(dedupe_info.get("warnings", []))
+        removed_hubspot_count = pre_dedupe_count - deduped.height
+        pre_dedupe_ids = set(working["__row_id"].to_list())
+        qualified_ids = set(deduped["__row_id"].to_list())
+        removed_hubspot_ids = pre_dedupe_ids - qualified_ids
+
+        _update_run(
+            stage="finalizing",
+            progress=0.94 if homepage_check else 0.9,
+            message="Finalizing row statuses...",
+            qualifiedIds=qualified_ids,
+            removedHubspotIds=removed_hubspot_ids,
+            removedBreakdown={
+                "removedFilter": removed_filter_count,
+                "removedDomain": removed_domain_count,
+                "removedHubspot": removed_hubspot_count,
+            },
+            qualifiedCount=len(qualified_ids),
+            removedCount=total_rows - len(qualified_ids),
+        )
+
+        rows = []
+        for row in df_with_id.to_dicts():
+            row_id = int(row.pop("__row_id"))
+            if row_id in qualified_ids:
+                row_status = "qualified"
+                row_reasons = ["qualified_passed_all_checks"]
+            elif row_id in removed_filter_ids:
+                row_status = "removed_filter"
+                row_reasons = [str(removed_filter_reason_by_id.get(row_id, "rule_filter_mismatch"))]
+            elif row_id in removed_domain_ids:
+                row_status = "removed_domain"
+                domain_detail = removed_domain_reason_by_id.get(row_id, "unreachable")
+                row_reasons = [f"domain_{domain_detail}".replace("/", "_").replace(" ", "_").replace(":", "_")]
+            elif row_id in removed_hubspot_ids:
+                row_status = "removed_hubspot"
+                row_reasons = ["hubspot_duplicate_match"]
+            else:
+                row_status = "removed_filter"
+                row_reasons = [str(removed_filter_reason_by_id.get(row_id, "rule_filter_mismatch"))]
+
+            rows.append({
+                **row,
+                "_rowId": row_id,
+                "_rowStatus": row_status,
+                "_rowReasons": row_reasons,
+            })
+
+        qualified_for_return = deduped.drop("__row_id")
+        output_columns = [col for col in df_with_id.columns if col != "__row_id"]
+        removed_breakdown = {
+            "removedFilter": removed_filter_count,
+            "removedDomain": removed_domain_count,
+            "removedHubspot": removed_hubspot_count,
+        }
+        processing_ms = int((time.perf_counter() - start_time) * 1000)
+
+        result = {
+            "sessionId": session_id,
+            "totalRows": total_rows,
+            "qualifiedCount": qualified_for_return.height,
+            "removedCount": total_rows - qualified_for_return.height,
+            "removedBreakdown": removed_breakdown,
+            "rows": rows,
+            "leads": qualified_for_return.to_dicts(),
+            "columns": output_columns,
+            "domainResults": {
+                "checked": domain_checked_count,
+                "homepageChecked": homepage_checked_count,
+                "dead": dead_domains,
+                "cdnReference": get_cdn_reference_data(),
+            },
+            "meta": {
+                "processingMs": processing_ms,
+                "domainCheckEnabled": domain_check,
+                "homepageCheckEnabled": homepage_check,
+                "websiteKeywords": website_keywords,
+                "tldFilter": {
+                    "excludeCountryTlds": exclude_country_tlds,
+                    "disallowList": sorted(disallowed_tlds),
+                    "allowList": sorted(allowed_tlds),
+                },
+                "dedupe": dedupe_info,
+                "warnings": warnings,
+            },
+        }
+
+        session, run = _get_current_run()
+        if session and run:
+            status_sets = {
+                "qualifiedIds": qualified_ids,
+                "removedFilterIds": removed_filter_ids,
+                "removedFilterReasonById": removed_filter_reason_by_id,
+                "removedDomainIds": removed_domain_ids,
+                "removedHubspotIds": removed_hubspot_ids,
+                "removedDomainReasonById": removed_domain_reason_by_id,
+            }
+            run.update({
+                "status": "done",
+                "stage": "complete",
+                "progress": 1.0,
+                "message": "Qualification complete.",
+                "processedRows": total_rows,
+                "totalRows": total_rows,
+                "qualifiedCount": result["qualifiedCount"],
+                "removedCount": result["removedCount"],
+                "removedBreakdown": removed_breakdown,
+                "warnings": warnings,
+                "domainResults": result["domainResults"],
+                "error": "",
+                "finishedAt": time.time(),
+                "result": result,
+                **status_sets,
+            })
+            session["lastRunResult"] = result
+            session["lastRunStatus"] = status_sets
+            session["updatedAt"] = time.time()
+            _persist_session(session_id, session)
+
+    except Exception as exc:
+        session, run = _get_current_run()
+        if session and run:
+            run.update({
+                "status": "error",
+                "stage": "error",
+                "progress": 1.0,
+                "message": "Qualification failed.",
+                "error": f"{type(exc).__name__}: {exc}",
+                "finishedAt": time.time(),
+            })
+            session["updatedAt"] = time.time()
+            _persist_session(session_id, session)
+        traceback.print_exc()
+
+
+def fuzzy_match(value: str, targets: list[str], threshold: float) -> bool:
+    """Return True if `value` fuzzy-matches ANY of `targets` above `threshold`."""
+    if not value:
+        return False
+    v = value.strip().lower()
+    for t in targets:
+        t_clean = t.strip().lower()
+        score = fuzz.token_sort_ratio(v, t_clean)
+        if score >= threshold:
+            return True
+        if fuzz.partial_ratio(v, t_clean) >= threshold:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Domain Liveness Checker (async, concurrent)
+# ---------------------------------------------------------------------------
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+# Domains that are known parking / placeholder services → treat as dead
+PARKED_INDICATORS = [
+    "godaddy", "namecheap", "parked", "buy this domain",
+    "domain for sale", "this domain", "squarespace",
+    "coming soon", "under construction", "page not found",
+]
+
+async def check_single_domain(session: aiohttp.ClientSession, domain: str, timeout: int = 6) -> dict:
+    """
+    Check if a single domain is alive. Uses HEAD first (fast), falls back to GET.
+    Returns {domain, alive: bool, status: str}.
+    """
+    if not domain or domain.lower() in ("unknown", "n/a", "none", ""):
+        return {"domain": domain, "alive": False, "status": "no domain"}
+
+    clean = normalize_domain(domain)
+    if not clean or "." not in clean:
+        return {"domain": domain, "alive": False, "status": "invalid"}
+
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    for proto in ["https", "http"]:
+        url = f"{proto}://{clean}"
+        # Try HEAD first (fast, low bandwidth)
+        try:
+            async with session.head(url, timeout=aiohttp.ClientTimeout(total=timeout),
+                                     ssl=ssl_ctx, allow_redirects=True) as resp:
+                if resp.status < 500:
+                    return {"domain": domain, "alive": True, "status": str(resp.status)}
+        except Exception:
+            pass
+
+        # Fall back to GET (some servers reject HEAD)
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout),
+                                    ssl=ssl_ctx, allow_redirects=True) as resp:
+                if resp.status < 500:
+                    # Quick check for parked/dead page content
+                    try:
+                        body = await resp.text(encoding="utf-8", errors="replace")
+                        body_lower = body[:2000].lower()
+                        if any(indicator in body_lower for indicator in PARKED_INDICATORS):
+                            return {"domain": domain, "alive": False, "status": "parked/placeholder"}
+                    except Exception:
+                        pass
+                    return {"domain": domain, "alive": True, "status": str(resp.status)}
+        except Exception:
+            continue
+
+    return {"domain": domain, "alive": False, "status": "unreachable"}
+
+
+async def check_domains_batch(domains: list[str], concurrency: int = 20, timeout: int = 6) -> dict:
+    """
+    Check many domains concurrently. Returns {domain: {alive, status}} dict.
+    Uses a semaphore to limit concurrency and avoid overwhelming the network.
+    """
+    sem = asyncio.Semaphore(concurrency)
+    connector = aiohttp.TCPConnector(limit=concurrency, ttl_dns_cache=300)
+
+    async def bounded_check(session, domain):
+        async with sem:
+            return await check_single_domain(session, domain, timeout)
+
+    async with aiohttp.ClientSession(connector=connector, headers=HEADERS) as session:
+        tasks = [bounded_check(session, d) for d in domains]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    out = {}
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        out[r["domain"]] = {"alive": r["alive"], "status": r["status"]}
+    return out
+
+
+def _build_contains_group_expr(col_expr, group: dict):
+    """Build a Polars expression for a single value group (tags + logic)."""
+    tags = [v.strip() for v in group.get("tags", []) if v.strip()]
+    logic = group.get("logic", "and").lower()
+    if not tags:
+        return pl.lit(True)
+    if logic == "and":
+        expr = pl.lit(True)
+        for v in tags:
+            expr = expr & col_expr.str.contains(v.lower(), literal=True)
+    else:
+        expr = pl.lit(False)
+        for v in tags:
+            expr = expr | col_expr.str.contains(v.lower(), literal=True)
+    return expr
+
+
+def _rule_values_preview(rule: dict, max_items: int = 3) -> str:
+    groups = rule.get("groups", [])
+    if groups:
+        values = [str(v).strip() for g in groups for v in g.get("tags", []) if str(v).strip()]
+    else:
+        values = [str(v).strip() for v in rule.get("values", []) if str(v).strip()]
+    if not values:
+        return ""
+    shown = values[:max_items]
+    text = ", ".join(shown)
+    if len(values) > max_items:
+        text = f"{text}, +{len(values) - max_items} more"
+    return text
+
+
+def _format_rule_reason(rule: dict, index: int) -> str:
+    field = str(rule.get("field") or "field")
+    match_type = str(rule.get("matchType") or "").lower()
+    values_preview = _rule_values_preview(rule)
+
+    if match_type == "range":
+        min_val = str(rule.get("min") or "").strip()
+        max_val = str(rule.get("max") or "").strip()
+        if min_val and max_val:
+            clause = f"{field} between {min_val} and {max_val}"
+        elif min_val:
+            clause = f"{field} at least {min_val}"
+        elif max_val:
+            clause = f"{field} at most {max_val}"
+        else:
+            clause = f"{field} range rule"
+        return f"Failed rule {index}: {clause}"
+
+    if match_type == "dates":
+        start_date = str(rule.get("startDate") or "").strip()
+        end_date = str(rule.get("endDate") or "").strip()
+        if start_date and end_date:
+            clause = f"{field} between {start_date} and {end_date}"
+        elif start_date:
+            clause = f"{field} on or after {start_date}"
+        elif end_date:
+            clause = f"{field} on or before {end_date}"
+        else:
+            clause = f"{field} date range rule"
+        return f"Failed rule {index}: {clause}"
+
+    if match_type == "contains":
+        clause = f"{field} contains"
+    elif match_type == "exact":
+        clause = f"{field} equals"
+    elif match_type == "fuzzy":
+        clause = f"{field} fuzzy match"
+    elif match_type == "excludes":
+        clause = f"{field} excludes"
+    else:
+        clause = f"{field} ({match_type or 'rule'})"
+
+    if values_preview:
+        return f"Failed rule {index}: {clause} {values_preview}"
+    return f"Failed rule {index}: {clause}"
+
+
+def apply_rules_with_trace(df: pl.DataFrame, rules: list[dict]) -> tuple[pl.DataFrame, dict[int, str]]:
+    """
+    Apply rules and return:
+    - filtered dataframe
+    - row_id -> specific failed rule reason (first rule that removed the row)
+    """
+    if "__row_id" not in df.columns:
+        filtered = apply_rules(df, rules)
+        return filtered, {}
+
+    working = df
+    removed_reason_by_id: dict[int, str] = {}
+
+    for idx, rule in enumerate(rules, start=1):
+        before = working
+        after = apply_rules(before, [rule])
+
+        before_ids = set(before["__row_id"].to_list())
+        after_ids = set(after["__row_id"].to_list())
+        removed_ids = before_ids - after_ids
+        if removed_ids:
+            reason = _format_rule_reason(rule, idx)
+            for row_id in removed_ids:
+                removed_reason_by_id[int(row_id)] = reason
+        working = after
+
+    return working, removed_reason_by_id
+
+
+def apply_rules(df: pl.DataFrame, rules: list[dict]) -> pl.DataFrame:
+    """
+    Apply ICP rules to filter the DataFrame.
+    Rules are ANDed together. Within a 'contains' rule, groups combine via groupsLogic.
+    """
+    for rule in rules:
+        field = rule["field"]
+        match_type = rule["matchType"]
+
+        if field not in df.columns:
+            continue
+
+        if match_type == "exact":
+            # Flatten groups into values, or use legacy values
+            groups = rule.get("groups", [])
+            if groups:
+                values = [v.strip() for g in groups for v in g.get("tags", []) if v.strip()]
+            else:
+                values = [v.strip() for v in rule.get("values", []) if v.strip()]
+            if not values:
+                continue
+            lower_vals = [v.lower() for v in values]
+            mask = df[field].cast(pl.Utf8).str.to_lowercase().is_in(lower_vals)
+            df = df.filter(mask)
+
+        elif match_type == "contains":
+            groups = rule.get("groups", [])
+            col_expr = df[field].cast(pl.Utf8).str.to_lowercase()
+
+            if groups:
+                # New grouped logic
+                groups_logic = rule.get("groupsLogic", "or").lower()
+                group_exprs = [_build_contains_group_expr(col_expr, g) for g in groups]
+                group_exprs = [e for e in group_exprs if e is not None]
+                if not group_exprs:
+                    continue
+                if groups_logic == "and":
+                    combined = group_exprs[0]
+                    for e in group_exprs[1:]:
+                        combined = combined & e
+                else:
+                    combined = group_exprs[0]
+                    for e in group_exprs[1:]:
+                        combined = combined | e
+                df = df.filter(combined)
+            else:
+                # Legacy flat values
+                values = [v.strip() for v in rule.get("values", []) if v.strip()]
+                if not values:
+                    continue
+                logic = rule.get("logic", "or").lower()
+                if logic == "and":
+                    combined_expr = pl.lit(True)
+                    for v in values:
+                        combined_expr = combined_expr & col_expr.str.contains(v.lower(), literal=True)
+                else:
+                    combined_expr = pl.lit(False)
+                    for v in values:
+                        combined_expr = combined_expr | col_expr.str.contains(v.lower(), literal=True)
+                df = df.filter(combined_expr)
+
+        elif match_type == "fuzzy":
+            groups = rule.get("groups", [])
+            if groups:
+                values = [v.strip() for g in groups for v in g.get("tags", []) if v.strip()]
+            else:
+                values = [v.strip() for v in rule.get("values", []) if v.strip()]
+            if not values:
+                continue
+            threshold = float(rule.get("threshold", 80))
+            mask = (
+                df[field]
+                .cast(pl.Utf8)
+                .map_elements(lambda x: fuzzy_match(x, values, threshold), return_dtype=pl.Boolean)
+            )
+            df = df.filter(mask)
+
+        elif match_type == "range":
+            min_val = rule.get("min")
+            max_val = rule.get("max")
+            text_expr = pl.col(field).cast(pl.Utf8, strict=False).fill_null("")
+            blank_expr = text_expr.str.strip_chars() == ""
+            numeric_expr = (
+                text_expr
+                .str.replace_all(r"[^0-9.\-]", "")
+                .cast(pl.Float64, strict=False)
+            )
+            range_expr = pl.lit(True)
+            if min_val is not None and str(min_val).strip():
+                range_expr = range_expr & (numeric_expr >= float(min_val))
+            if max_val is not None and str(max_val).strip():
+                range_expr = range_expr & (numeric_expr <= float(max_val))
+            # If minimum is intentionally blank, keep rows where the value is blank.
+            if not (min_val is not None and str(min_val).strip()):
+                range_expr = blank_expr | range_expr
+            df = df.filter(range_expr)
+
+        elif match_type == "dates":
+            start_raw = str(rule.get("startDate") or "").strip()
+            end_raw = str(rule.get("endDate") or "").strip()
+            if not start_raw and not end_raw:
+                continue
+
+            text_expr = pl.col(field).cast(pl.Utf8, strict=False).fill_null("").str.strip_chars()
+            parsed_expr = text_expr.str.strptime(pl.Datetime, strict=False)
+
+            start_dt = _safe_parse_iso_datetime(start_raw) if start_raw else None
+            end_dt = _safe_parse_iso_datetime(end_raw) if end_raw else None
+
+            if start_dt or end_dt:
+                date_expr = parsed_expr.is_not_null()
+                if start_dt:
+                    date_expr = date_expr & (parsed_expr >= start_dt)
+                elif start_raw:
+                    date_expr = date_expr & (text_expr >= start_raw)
+                if end_dt:
+                    date_expr = date_expr & (parsed_expr <= end_dt)
+                elif end_raw:
+                    date_expr = date_expr & (text_expr <= end_raw)
+            else:
+                date_expr = text_expr != ""
+                if start_raw:
+                    date_expr = date_expr & (text_expr >= start_raw)
+                if end_raw:
+                    date_expr = date_expr & (text_expr <= end_raw)
+
+            df = df.filter(date_expr)
+
+        elif match_type == "excludes":
+            groups = rule.get("groups", [])
+            if groups:
+                values = [v.strip() for g in groups for v in g.get("tags", []) if v.strip()]
+            else:
+                values = [v.strip() for v in rule.get("values", []) if v.strip()]
+            if not values:
+                continue
+            threshold = float(rule.get("threshold", 80))
+            mask = (
+                df[field]
+                .cast(pl.Utf8)
+                .map_elements(lambda x: not fuzzy_match(x, values, threshold), return_dtype=pl.Boolean)
+            )
+            df = df.filter(mask)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/upload")
+async def upload_csv(
+    files: Optional[list[UploadFile]] = File(None),
+    file: Optional[UploadFile] = File(None),
+):
+    """Parse uploaded CSV and return column metadata for rule building."""
+    source_files = _resolve_upload_files(files, file)
+    source_bundle = await _parse_upload_datasets(source_files, label="source")
+    df = source_bundle["df"]
+    file_names = source_bundle["fileNames"]
+
+    columns_info, column_profiles = build_columns_info(df)
+    preview_rows = df.head(PREVIEW_ROW_LIMIT).to_dicts()
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    tmp.close()
+    df.write_csv(tmp.name)
+
+    return {
+        "fileName": _summarize_file_names(file_names, "dataset.csv"),
+        "fileNames": file_names,
+        "fileCount": len(file_names),
+        "columns": columns_info,
+        "columnProfiles": column_profiles,
+        "totalRows": df.height,
+        "sourceRows": source_bundle["inputRows"],
+        "sourceMappings": source_bundle["mapping"],
+        "tempPath": tmp.name,
+        "preview": preview_rows,  # backward-compatible legacy field
+        "previewRows": preview_rows,
+    }
+
+
+@app.post("/api/session/upload")
+async def session_upload(
+    files: Optional[list[UploadFile]] = File(None),
+    file: Optional[UploadFile] = File(None),
+    dedupeFiles: Optional[list[UploadFile]] = File(None),
+    dedupeFile: Optional[UploadFile] = File(None),
+):
+    """
+    Sessionized upload endpoint.
+    Stores source CSV in-memory and returns session metadata for subsequent preview/qualify/export calls.
+    """
+    source_files = _resolve_upload_files(files, file)
+    source_bundle = await _parse_upload_datasets(source_files, label="source")
+    df = source_bundle["df"]
+    source_file_names = source_bundle["fileNames"]
+    columns_info, column_profiles = build_columns_info(df)
+    anomalies = build_column_anomalies(column_profiles, df.height)
+    preview_rows = df.head(PREVIEW_ROW_LIMIT).to_dicts()
+
+    dedupe_files = _resolve_upload_files(dedupeFiles, dedupeFile)
+    dedupe_bundle = await _parse_upload_datasets(dedupe_files, label="dedupe") if dedupe_files else None
+    parsed_dedupe_df = dedupe_bundle["df"] if dedupe_bundle else None
+    dedupe_file_names = dedupe_bundle["fileNames"] if dedupe_bundle else []
+    dedupe_name = _summarize_file_names(dedupe_file_names, "hubspot.csv") if dedupe_bundle else None
+    dedupe_raw = dedupe_bundle["raws"][0] if dedupe_bundle and dedupe_bundle["raws"] else None
+
+    source_name = _summarize_file_names(source_file_names, "dataset.csv")
+    sid = _put_session(
+        raw_csv=source_bundle["raws"][0],
+        file_name=source_name,
+        df=df,
+        columns_info=columns_info,
+        column_profiles=column_profiles,
+        preview_rows=preview_rows,
+        anomalies=anomalies,
+        dedupe_raw=dedupe_raw,
+        dedupe_name=dedupe_name,
+        dedupe_df=parsed_dedupe_df,
+        source_raws=source_bundle["raws"],
+        source_file_names=source_file_names,
+        source_mapping=source_bundle["mapping"],
+        source_rows=source_bundle["inputRows"],
+        dedupe_raws=dedupe_bundle["raws"] if dedupe_bundle else [],
+        dedupe_file_names=dedupe_file_names,
+        dedupe_mapping=dedupe_bundle["mapping"] if dedupe_bundle else [],
+        dedupe_source_rows=dedupe_bundle["inputRows"] if dedupe_bundle else 0,
+    )
+    dedupe_payload = {
+        "enabled": bool(dedupe_bundle),
+        "fileName": dedupe_name,
+        "fileNames": dedupe_file_names,
+        "fileCount": len(dedupe_file_names),
+    }
+    if parsed_dedupe_df is not None:
+        inferred_matches = infer_dedupe_matches(df.columns, parsed_dedupe_df.columns)
+        primary_match = inferred_matches[0] if inferred_matches else {"sourceColumn": None, "hubspotColumn": None, "keyType": None}
+        dedupe_payload.update({
+            "columns": parsed_dedupe_df.columns,
+            "totalRows": parsed_dedupe_df.height,
+            "sourceRows": dedupe_bundle["inputRows"] if dedupe_bundle else parsed_dedupe_df.height,
+            "sourceMappings": dedupe_bundle["mapping"] if dedupe_bundle else [],
+            "inferredMatch": {
+                "sourceColumn": primary_match.get("sourceColumn"),
+                "hubspotColumn": primary_match.get("hubspotColumn"),
+                "keyType": primary_match.get("keyType"),
+            },
+            "inferredMatches": inferred_matches,
+        })
+
+    return {
+        "sessionId": sid,
+        "fileName": source_name,
+        "fileNames": source_file_names,
+        "fileCount": len(source_file_names),
+        "columns": columns_info,
+        "columnProfiles": column_profiles,
+        "previewRows": preview_rows,
+        "totalRows": df.height,
+        "sourceRows": source_bundle["inputRows"],
+        "sourceMappings": source_bundle["mapping"],
+        "anomalies": anomalies,
+        "dedupe": dedupe_payload,
+    }
+
+
+@app.get("/api/session/state")
+async def session_state(sessionId: str):
+    """Return persisted session metadata so users can restore work from Recent runs."""
+    session = _touch_session(sessionId)
+    payload = _build_session_payload(sessionId, session)
+    _persist_session(sessionId, session)
+    return payload
+
+
+@app.post("/api/session/dedupe")
+async def session_set_dedupe(
+    sessionId: str = Form(...),
+    dedupeFiles: Optional[list[UploadFile]] = File(None),
+    dedupeFile: Optional[UploadFile] = File(None),
+):
+    """Attach (append) or clear HubSpot dedupe files for an existing session."""
+    session = _touch_session(sessionId)
+    source_df = _get_session_df(session)
+    dedupe_uploads = _resolve_upload_files(dedupeFiles, dedupeFile)
+    if not dedupe_uploads:
+        _set_session_dedupe(sessionId, None, None, None, dedupe_raws=[], dedupe_file_names=[], dedupe_mapping=[], dedupe_source_rows=0)
+        return {"sessionId": sessionId, "dedupe": {"enabled": False, "fileName": None, "fileNames": [], "fileCount": 0, "columns": [], "totalRows": 0}}
+
+    dedupe_bundle = await _parse_upload_datasets(dedupe_uploads, label="dedupe")
+    existing_raws = [raw for raw in (session.get("dedupeRaws") or []) if raw]
+    existing_names = [str(name or "").strip() for name in (session.get("dedupeFileNames") or []) if str(name or "").strip()]
+
+    dedupe_raws = existing_raws + list(dedupe_bundle["raws"])
+    dedupe_file_names = existing_names + list(dedupe_bundle["fileNames"])
+    dedupe_df, dedupe_mapping, dedupe_input_rows = _rebuild_dedupe_from_raws(dedupe_raws, dedupe_file_names)
+    if dedupe_df is None:
+        raise HTTPException(status_code=400, detail="Unable to parse dedupe files.")
+
+    dedupe_name = _summarize_file_names(dedupe_file_names, "hubspot.csv")
+    _set_session_dedupe(
+        sessionId,
+        dedupe_raws[0],
+        dedupe_name,
+        dedupe_df,
+        dedupe_raws=dedupe_raws,
+        dedupe_file_names=dedupe_file_names,
+        dedupe_mapping=dedupe_mapping,
+        dedupe_source_rows=dedupe_input_rows,
+    )
+    inferred_matches = infer_dedupe_matches(source_df.columns, dedupe_df.columns)
+    primary_match = inferred_matches[0] if inferred_matches else {"sourceColumn": None, "hubspotColumn": None, "keyType": None}
+    return {
+        "sessionId": sessionId,
+        "dedupe": {
+            "enabled": True,
+            "fileName": dedupe_name,
+            "fileNames": dedupe_file_names,
+            "fileCount": len(dedupe_file_names),
+            "columns": dedupe_df.columns,
+            "totalRows": dedupe_df.height,
+            "sourceRows": dedupe_input_rows,
+            "sourceMappings": dedupe_mapping,
+            "inferredMatch": {
+                "sourceColumn": primary_match.get("sourceColumn"),
+                "hubspotColumn": primary_match.get("hubspotColumn"),
+                "keyType": primary_match.get("keyType"),
+            },
+            "inferredMatches": inferred_matches,
+        },
+    }
+
+
+@app.post("/api/session/preview")
+async def session_preview(
+    sessionId: str = Form(...),
+    rules: str = Form("[]"),
+    domainCheck: str = Form("false"),
+    homepageCheck: str = Form("false"),
+    domainField: str = Form(""),
+    websiteKeywords: str = Form("[]"),
+    excludeCountryTlds: str = Form("false"),
+    tldDisallowList: str = Form("[]"),
+    tldAllowList: str = Form("[]"),
+):
+    """Preview estimate using an existing uploaded session."""
+    session = _touch_session(sessionId)
+    df = _get_session_df(session)
+    dedupe_df = _get_session_dedupe_df(session)
+    parsed_rules = _parse_rules_payload(rules)
+    exclude_country_tlds = _parse_form_bool(excludeCountryTlds)
+    disallowed_tlds = _parse_tld_list_payload(tldDisallowList)
+    allowed_tlds = _parse_tld_list_payload(tldAllowList)
+    website_keywords = _parse_website_keywords_payload(websiteKeywords)
+    pipeline = await run_qualification_pipeline(
+        df=df,
+        parsed_rules=parsed_rules,
+        domain_check=_parse_form_bool(domainCheck),
+        homepage_check=_parse_form_bool(homepageCheck),
+        domain_field=domainField,
+        website_keywords=website_keywords,
+        exclude_country_tlds=exclude_country_tlds,
+        disallowed_tlds=disallowed_tlds,
+        allowed_tlds=allowed_tlds,
+        dedupe_raw=session.get("dedupeRaw"),
+        dedupe_df=dedupe_df,
+        include_rows=False,
+        include_leads=False,
+    )
+    return {
+        "sessionId": sessionId,
+        "estimatedQualifiedCount": pipeline["qualifiedCount"],
+        "estimatedRemovedCount": pipeline["removedCount"],
+        "removedBreakdown": pipeline["removedBreakdown"],
+        "totalRows": df.height,
+        "dedupeMeta": pipeline["dedupeInfo"],
+    }
+
+
+@app.post("/api/session/rows")
+async def session_rows(
+    sessionId: str = Form(...),
+    page: int = Form(1),
+    pageSize: int = Form(100),
+    search: str = Form(""),
+    sortCol: str = Form(""),
+    sortDir: str = Form(""),
+    viewFilters: str = Form("[]"),
+):
+    """
+    Paginated table rows for active session datasets.
+    Optimized for pre-qualification table browsing across full spreadsheets.
+    """
+    session = _touch_session(sessionId)
+    df = _get_session_df(session)
+
+    safe_size = max(10, min(int(pageSize or 100), 500))
+    safe_page = max(1, int(page or 1))
+
+    working = df.with_row_count("__row_id")
+    working = _apply_view_filters(working, viewFilters, df.columns)
+    query = (search or "").strip().lower()
+
+    if query:
+        expr = None
+        for col in df.columns:
+            col_expr = (
+                pl.col(col)
+                .cast(pl.Utf8, strict=False)
+                .str.to_lowercase()
+                .str.contains(query, literal=True)
+            )
+            expr = col_expr if expr is None else (expr | col_expr)
+        if expr is not None:
+            working = working.filter(expr)
+
+    if sortCol and sortCol in df.columns and sortDir.lower() in ("asc", "desc"):
+        descending = sortDir.lower() == "desc"
+        try:
+            working = working.sort(sortCol, descending=descending, nulls_last=True)
+        except Exception:
+            working = working.sort(
+                pl.col(sortCol).cast(pl.Utf8, strict=False).str.to_lowercase(),
+                descending=descending,
+            )
+
+    filtered_rows = working.height
+    total_pages = max(1, (filtered_rows + safe_size - 1) // safe_size)
+    safe_page = min(safe_page, total_pages)
+    start = (safe_page - 1) * safe_size
+    page_df = working.slice(start, safe_size)
+
+    rows = []
+    active_run = session.get("activeRun")
+    running_run = active_run if isinstance(active_run, dict) and active_run.get("status") == "running" else None
+    status_source = running_run or session.get("lastRunStatus")
+
+    for item in page_df.to_dicts():
+        row_id = int(item.pop("__row_id"))
+        row_status, row_reasons = _resolve_row_annotation(row_id, status_source)
+        rows.append({
+            **item,
+            "_rowId": row_id,
+            "_rowStatus": row_status,
+            "_rowReasons": row_reasons,
+        })
+
+    return {
+        "sessionId": sessionId,
+        "rows": rows,
+        "totalRows": df.height,
+        "filteredRows": filtered_rows,
+        "page": safe_page,
+        "pageSize": safe_size,
+        "qualificationProgress": _serialize_run_snapshot(active_run, include_result=False) if isinstance(active_run, dict) else None,
+    }
+
+
+@app.post("/api/session/qualify/start")
+async def session_qualify_start(
+    sessionId: str = Form(...),
+    rules: str = Form("[]"),
+    domainCheck: str = Form("false"),
+    homepageCheck: str = Form("false"),
+    domainField: str = Form(""),
+    websiteKeywords: str = Form("[]"),
+    excludeCountryTlds: str = Form("false"),
+    tldDisallowList: str = Form("[]"),
+    tldAllowList: str = Form("[]"),
+):
+    """Start an async qualification run for live progress updates."""
+    session = _touch_session(sessionId)
+    df = _get_session_df(session)
+    parsed_rules = _parse_rules_payload(rules)
+    domain_check = _parse_form_bool(domainCheck)
+    homepage_check = _parse_form_bool(homepageCheck)
+    website_keywords = _parse_website_keywords_payload(websiteKeywords)
+    exclude_country_tlds = _parse_form_bool(excludeCountryTlds)
+    disallowed_tlds = _parse_tld_list_payload(tldDisallowList)
+    allowed_tlds = _parse_tld_list_payload(tldAllowList)
+
+    active = session.get("activeRun")
+    if isinstance(active, dict) and active.get("status") == "running":
+        payload = _serialize_run_snapshot(active, include_result=False)
+        payload["sessionId"] = sessionId
+        payload["alreadyRunning"] = True
+        return payload
+
+    run_id = uuid4().hex
+    now = time.time()
+    session["activeRun"] = {
+        "runId": run_id,
+        "status": "running",
+        "stage": "starting",
+        "progress": 0.02,
+        "message": "Preparing qualification run...",
+        "processedRows": 0,
+        "totalRows": int(df.height),
+        "qualifiedCount": 0,
+        "removedCount": 0,
+        "removedBreakdown": {
+            "removedFilter": 0,
+            "removedDomain": 0,
+            "removedHubspot": 0,
+        },
+        "removedFilterIds": set(),
+        "removedDomainIds": set(),
+        "removedHubspotIds": set(),
+        "qualifiedIds": set(),
+        "removedDomainReasonById": {},
+        "startedAt": now,
+        "finishedAt": None,
+        "error": "",
+        "result": None,
+    }
+    session["updatedAt"] = now
+
+    asyncio.create_task(
+        _run_session_qualification_job(
+            session_id=sessionId,
+            run_id=run_id,
+            parsed_rules=parsed_rules,
+            domain_check=domain_check,
+            homepage_check=homepage_check,
+            domain_field=domainField,
+            website_keywords=website_keywords,
+            exclude_country_tlds=exclude_country_tlds,
+            disallowed_tlds=disallowed_tlds,
+            allowed_tlds=allowed_tlds,
+        )
+    )
+
+    payload = _serialize_run_snapshot(session.get("activeRun"), include_result=False)
+    payload["sessionId"] = sessionId
+    payload["alreadyRunning"] = False
+    return payload
+
+
+@app.get("/api/session/qualify/progress")
+async def session_qualify_progress(sessionId: str):
+    """Read progress for the active async qualification run."""
+    session = _touch_session(sessionId)
+    run = session.get("activeRun")
+    payload = _serialize_run_snapshot(run, include_result=True)
+    payload["sessionId"] = sessionId
+    return payload
+
+
+@app.post("/api/session/qualify")
+async def session_qualify(
+    sessionId: str = Form(...),
+    rules: str = Form("[]"),
+    domainCheck: str = Form("false"),
+    homepageCheck: str = Form("false"),
+    domainField: str = Form(""),
+    websiteKeywords: str = Form("[]"),
+    excludeCountryTlds: str = Form("false"),
+    tldDisallowList: str = Form("[]"),
+    tldAllowList: str = Form("[]"),
+):
+    """Run qualification against a stored session dataset."""
+    try:
+        start_time = time.perf_counter()
+        session = _touch_session(sessionId)
+        df = _get_session_df(session)
+        dedupe_df = _get_session_dedupe_df(session)
+        parsed_rules = _parse_rules_payload(rules)
+        domain_check = _parse_form_bool(domainCheck)
+        homepage_check = _parse_form_bool(homepageCheck)
+        website_keywords = _parse_website_keywords_payload(websiteKeywords)
+        exclude_country_tlds = _parse_form_bool(excludeCountryTlds)
+        disallowed_tlds = _parse_tld_list_payload(tldDisallowList)
+        allowed_tlds = _parse_tld_list_payload(tldAllowList)
+
+        pipeline = await run_qualification_pipeline(
+            df=df,
+            parsed_rules=parsed_rules,
+            domain_check=domain_check,
+            homepage_check=homepage_check,
+            domain_field=domainField,
+            website_keywords=website_keywords,
+            exclude_country_tlds=exclude_country_tlds,
+            disallowed_tlds=disallowed_tlds,
+            allowed_tlds=allowed_tlds,
+            dedupe_raw=session.get("dedupeRaw"),
+            dedupe_df=dedupe_df,
+        )
+        processing_ms = int((time.perf_counter() - start_time) * 1000)
+
+        result = {
+            "sessionId": sessionId,
+            "totalRows": df.height,
+            "qualifiedCount": pipeline["qualifiedCount"],
+            "removedCount": pipeline["removedCount"],
+            "removedBreakdown": pipeline["removedBreakdown"],
+            "rows": pipeline["rows"],
+            "leads": pipeline["leads"],
+            "columns": pipeline["columns"],
+            "domainResults": pipeline["domainResults"],
+            "meta": {
+                "processingMs": processing_ms,
+                "domainCheckEnabled": domain_check,
+                "homepageCheckEnabled": homepage_check,
+                "websiteKeywords": website_keywords,
+                "tldFilter": {
+                    "excludeCountryTlds": exclude_country_tlds,
+                    "disallowList": sorted(disallowed_tlds),
+                    "allowList": sorted(allowed_tlds),
+                },
+                "dedupe": pipeline["dedupeInfo"],
+                "warnings": pipeline["warnings"],
+            },
+        }
+
+        status_sets = _build_status_sets_from_rows(pipeline["rows"])
+        session["lastRunResult"] = result
+        session["lastRunStatus"] = status_sets
+        session["activeRun"] = {
+            "runId": uuid4().hex,
+            "status": "done",
+            "stage": "complete",
+            "progress": 1.0,
+            "message": "Qualification complete.",
+            "processedRows": int(df.height),
+            "totalRows": int(df.height),
+            "qualifiedCount": int(result["qualifiedCount"]),
+            "removedCount": int(result["removedCount"]),
+            "removedBreakdown": result["removedBreakdown"],
+            "startedAt": time.time(),
+            "finishedAt": time.time(),
+            "error": "",
+            "result": result,
+            **status_sets,
+        }
+        session["updatedAt"] = time.time()
+        _persist_session(sessionId, session)
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Qualification failed: {type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/api/session/export")
+async def session_export(
+    sessionId: str = Form(...),
+    rules: str = Form("[]"),
+    domainCheck: str = Form("false"),
+    homepageCheck: str = Form("false"),
+    domainField: str = Form(""),
+    websiteKeywords: str = Form("[]"),
+    excludeCountryTlds: str = Form("false"),
+    tldDisallowList: str = Form("[]"),
+    tldAllowList: str = Form("[]"),
+    exportColumns: str = Form(""),
+    fileName: str = Form("qualified_leads.csv"),
+):
+    """Export CSV from a stored session and current qualification config."""
+    session = _touch_session(sessionId)
+    df = _get_session_df(session)
+    dedupe_df = _get_session_dedupe_df(session)
+    parsed_rules = _parse_rules_payload(rules)
+    exclude_country_tlds = _parse_form_bool(excludeCountryTlds)
+    disallowed_tlds = _parse_tld_list_payload(tldDisallowList)
+    allowed_tlds = _parse_tld_list_payload(tldAllowList)
+    website_keywords = _parse_website_keywords_payload(websiteKeywords)
+    raw_export_columns = str(exportColumns or "").strip()
+    selected_export_columns = _parse_export_columns_payload(exportColumns)
+    if raw_export_columns and not selected_export_columns:
+        raise HTTPException(status_code=400, detail="Select at least one export column.")
+    pipeline = await run_qualification_pipeline(
+        df=df,
+        parsed_rules=parsed_rules,
+        domain_check=_parse_form_bool(domainCheck),
+        homepage_check=_parse_form_bool(homepageCheck),
+        domain_field=domainField,
+        website_keywords=website_keywords,
+        exclude_country_tlds=exclude_country_tlds,
+        disallowed_tlds=disallowed_tlds,
+        allowed_tlds=allowed_tlds,
+        dedupe_raw=session.get("dedupeRaw"),
+        dedupe_df=dedupe_df,
+        include_rows=False,
+        include_leads=False,
+        include_dataframe=True,
+    )
+    out_df = pipeline["qualifiedDf"] if isinstance(pipeline.get("qualifiedDf"), pl.DataFrame) else df.head(0)
+    if selected_export_columns:
+        out_df = _apply_export_column_selection(out_df, selected_export_columns)
+        if out_df.width == 0:
+            raise HTTPException(status_code=400, detail="None of the selected export columns are available.")
+    buf = io.BytesIO()
+    out_df.write_csv(buf)
+    buf.seek(0)
+    safe_name = (fileName or "qualified_leads.csv").strip() or "qualified_leads.csv"
+    if not safe_name.lower().endswith(".csv"):
+        safe_name = f"{safe_name}.csv"
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={safe_name}"},
+    )
+
+
+@app.post("/api/preview")
+async def preview_qualification(
+    files: Optional[list[UploadFile]] = File(None),
+    file: Optional[UploadFile] = File(None),
+    rules: str = Form("[]"),
+    domainCheck: str = Form("false"),
+    homepageCheck: str = Form("false"),
+    domainField: str = Form(""),
+    websiteKeywords: str = Form("[]"),
+    excludeCountryTlds: str = Form("false"),
+    tldDisallowList: str = Form("[]"),
+    tldAllowList: str = Form("[]"),
+    dedupeFiles: Optional[list[UploadFile]] = File(None),
+    dedupeFile: Optional[UploadFile] = File(None),
+):
+    """
+    Fast preview endpoint for configure-step feedback.
+    Returns estimated counts using current rule set and optional domain check.
+    """
+    source_files = _resolve_upload_files(files, file)
+    source_bundle = await _parse_upload_datasets(source_files, label="source")
+    df = source_bundle["df"]
+    parsed_rules = _parse_rules_payload(rules)
+    exclude_country_tlds = _parse_form_bool(excludeCountryTlds)
+    disallowed_tlds = _parse_tld_list_payload(tldDisallowList)
+    allowed_tlds = _parse_tld_list_payload(tldAllowList)
+    website_keywords = _parse_website_keywords_payload(websiteKeywords)
+    dedupe_uploads = _resolve_upload_files(dedupeFiles, dedupeFile)
+    dedupe_bundle = await _parse_upload_datasets(dedupe_uploads, label="dedupe") if dedupe_uploads else None
+    dedupe_raw = dedupe_bundle["raws"][0] if dedupe_bundle and dedupe_bundle["raws"] else None
+    dedupe_df = dedupe_bundle["df"] if dedupe_bundle else None
+    pipeline = await run_qualification_pipeline(
+        df=df,
+        parsed_rules=parsed_rules,
+        domain_check=_parse_form_bool(domainCheck),
+        homepage_check=_parse_form_bool(homepageCheck),
+        domain_field=domainField,
+        website_keywords=website_keywords,
+        exclude_country_tlds=exclude_country_tlds,
+        disallowed_tlds=disallowed_tlds,
+        allowed_tlds=allowed_tlds,
+        dedupe_raw=dedupe_raw,
+        dedupe_df=dedupe_df,
+        include_rows=False,
+        include_leads=False,
+    )
+
+    return {
+        "fileName": _summarize_file_names(source_bundle["fileNames"], "dataset.csv"),
+        "fileNames": source_bundle["fileNames"],
+        "fileCount": len(source_bundle["fileNames"]),
+        "estimatedQualifiedCount": pipeline["qualifiedCount"],
+        "estimatedRemovedCount": pipeline["removedCount"],
+        "totalRows": df.height,
+        "sourceRows": source_bundle["inputRows"],
+        "estimatedDuplicatesRemoved": pipeline["dedupeInfo"].get("removedCount", 0),
+        "removedBreakdown": pipeline["removedBreakdown"],
+    }
+
+
+@app.post("/api/qualify")
+async def qualify_leads(
+    files: Optional[list[UploadFile]] = File(None),
+    file: Optional[UploadFile] = File(None),
+    rules: str = Form("[]"),
+    domainCheck: str = Form("false"),
+    homepageCheck: str = Form("false"),
+    domainField: str = Form(""),
+    websiteKeywords: str = Form("[]"),
+    excludeCountryTlds: str = Form("false"),
+    tldDisallowList: str = Form("[]"),
+    tldAllowList: str = Form("[]"),
+    dedupeFiles: Optional[list[UploadFile]] = File(None),
+    dedupeFile: Optional[UploadFile] = File(None),
+):
+    """Apply ICP rules, optionally verify domains, return qualified leads."""
+    start_time = time.perf_counter()
+    source_files = _resolve_upload_files(files, file)
+    source_bundle = await _parse_upload_datasets(source_files, label="source")
+    df = source_bundle["df"]
+    parsed_rules = _parse_rules_payload(rules)
+    domain_check = _parse_form_bool(domainCheck)
+    homepage_check = _parse_form_bool(homepageCheck)
+    website_keywords = _parse_website_keywords_payload(websiteKeywords)
+    exclude_country_tlds = _parse_form_bool(excludeCountryTlds)
+    disallowed_tlds = _parse_tld_list_payload(tldDisallowList)
+    allowed_tlds = _parse_tld_list_payload(tldAllowList)
+    dedupe_uploads = _resolve_upload_files(dedupeFiles, dedupeFile)
+    dedupe_bundle = await _parse_upload_datasets(dedupe_uploads, label="dedupe") if dedupe_uploads else None
+    dedupe_raw = dedupe_bundle["raws"][0] if dedupe_bundle and dedupe_bundle["raws"] else None
+    dedupe_df = dedupe_bundle["df"] if dedupe_bundle else None
+
+    pipeline = await run_qualification_pipeline(
+        df=df,
+        parsed_rules=parsed_rules,
+        domain_check=domain_check,
+        homepage_check=homepage_check,
+        domain_field=domainField,
+        website_keywords=website_keywords,
+        exclude_country_tlds=exclude_country_tlds,
+        disallowed_tlds=disallowed_tlds,
+        allowed_tlds=allowed_tlds,
+        dedupe_raw=dedupe_raw,
+        dedupe_df=dedupe_df,
+    )
+    processing_ms = int((time.perf_counter() - start_time) * 1000)
+
+    return {
+        "fileName": _summarize_file_names(source_bundle["fileNames"], "dataset.csv"),
+        "fileNames": source_bundle["fileNames"],
+        "fileCount": len(source_bundle["fileNames"]),
+        "totalRows": df.height,
+        "sourceRows": source_bundle["inputRows"],
+        "qualifiedCount": pipeline["qualifiedCount"],
+        "removedCount": pipeline["removedCount"],
+        "removedBreakdown": pipeline["removedBreakdown"],
+        "leads": pipeline["leads"],
+        "rows": pipeline["rows"],
+        "columns": pipeline["columns"],
+        "domainResults": pipeline["domainResults"],
+        "meta": {
+            "processingMs": processing_ms,
+            "domainCheckEnabled": domain_check,
+            "homepageCheckEnabled": homepage_check,
+            "websiteKeywords": website_keywords,
+            "tldFilter": {
+                "excludeCountryTlds": exclude_country_tlds,
+                "disallowList": sorted(disallowed_tlds),
+                "allowList": sorted(allowed_tlds),
+            },
+            "dedupe": pipeline["dedupeInfo"],
+            "warnings": pipeline["warnings"],
+        },
+    }
+
+
+@app.post("/api/download")
+async def download_qualified(
+    files: Optional[list[UploadFile]] = File(None),
+    file: Optional[UploadFile] = File(None),
+    rules: str = Form("[]"),
+    domainCheck: str = Form("false"),
+    homepageCheck: str = Form("false"),
+    domainField: str = Form(""),
+    websiteKeywords: str = Form("[]"),
+    excludeCountryTlds: str = Form("false"),
+    tldDisallowList: str = Form("[]"),
+    tldAllowList: str = Form("[]"),
+    exportColumns: str = Form(""),
+    dedupeFiles: Optional[list[UploadFile]] = File(None),
+    dedupeFile: Optional[UploadFile] = File(None),
+):
+    """Apply ICP rules, optionally verify domains, return CSV download."""
+    source_files = _resolve_upload_files(files, file)
+    source_bundle = await _parse_upload_datasets(source_files, label="source")
+    df = source_bundle["df"]
+    parsed_rules = _parse_rules_payload(rules)
+    exclude_country_tlds = _parse_form_bool(excludeCountryTlds)
+    disallowed_tlds = _parse_tld_list_payload(tldDisallowList)
+    allowed_tlds = _parse_tld_list_payload(tldAllowList)
+    website_keywords = _parse_website_keywords_payload(websiteKeywords)
+    raw_export_columns = str(exportColumns or "").strip()
+    selected_export_columns = _parse_export_columns_payload(exportColumns)
+    if raw_export_columns and not selected_export_columns:
+        raise HTTPException(status_code=400, detail="Select at least one export column.")
+    dedupe_uploads = _resolve_upload_files(dedupeFiles, dedupeFile)
+    dedupe_bundle = await _parse_upload_datasets(dedupe_uploads, label="dedupe") if dedupe_uploads else None
+    dedupe_raw = dedupe_bundle["raws"][0] if dedupe_bundle and dedupe_bundle["raws"] else None
+    dedupe_df = dedupe_bundle["df"] if dedupe_bundle else None
+    pipeline = await run_qualification_pipeline(
+        df=df,
+        parsed_rules=parsed_rules,
+        domain_check=_parse_form_bool(domainCheck),
+        homepage_check=_parse_form_bool(homepageCheck),
+        domain_field=domainField,
+        website_keywords=website_keywords,
+        exclude_country_tlds=exclude_country_tlds,
+        disallowed_tlds=disallowed_tlds,
+        allowed_tlds=allowed_tlds,
+        dedupe_raw=dedupe_raw,
+        dedupe_df=dedupe_df,
+        include_rows=False,
+        include_leads=False,
+        include_dataframe=True,
+    )
+    qualified = pipeline["qualifiedDf"] if isinstance(pipeline.get("qualifiedDf"), pl.DataFrame) else df.head(0)
+    if selected_export_columns:
+        qualified = _apply_export_column_selection(qualified, selected_export_columns)
+        if qualified.width == 0:
+            raise HTTPException(status_code=400, detail="None of the selected export columns are available.")
+
+    buf = io.BytesIO()
+    qualified.write_csv(buf)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=qualified_leads.csv"},
+    )
+
+
+# Domain cache management endpoints
+@app.get("/api/cache/stats")
+async def get_domain_cache_stats():
+    """Get statistics about the domain validation cache."""
+    await init_cache()
+    stats = await get_cache_stats()
+    return stats
+
+
+@app.post("/api/cache/clear")
+async def clear_domain_cache():
+    """Clear all cached domain validation results."""
+    await init_cache()
+    await clear_all_cache()
+    return {"status": "success", "message": "Domain cache cleared"}
+
+
+# Mount static files LAST so API routes take priority
+app.mount("/fonts", StaticFiles(directory=str(FONTS_DIR)), name="fonts")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run Hound Suite backend API server.")
+    parser.add_argument("--host", default=os.getenv("HOUND_HOST", "127.0.0.1"), help="Bind host")
+    parser.add_argument("--port", type=int, default=int(os.getenv("HOUND_PORT", "8000")), help="Bind port")
+    parser.add_argument("--data-dir", default=str(_resolve_data_dir_from_env()), help="Writable data directory")
+    parser.add_argument("--log-level", default=os.getenv("HOUND_LOG_LEVEL", "info"), help="uvicorn log level")
+    return parser
+
+
+def main() -> None:
+    args = _build_arg_parser().parse_args()
+    os.environ["HOUND_DATA_DIR"] = str(args.data_dir)
+    _refresh_data_paths_from_env()
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=str(args.host),
+        port=int(args.port),
+        log_level=str(args.log_level).lower(),
+        reload=False,
+        access_log=False,
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,153 @@
+/* Kennel V2 Responsive */
+
+@media (min-width: 768px) and (max-width: 1199px) {
+
+  .ws-root,
+  .ws-root.drawer-open {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .ws-drawer {
+    display: none;
+  }
+
+  .ws-drawer.open {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(92vw, 360px);
+    display: block;
+    z-index: 55;
+    box-shadow: -12px 0 28px rgba(0, 0, 0, 0.45);
+  }
+
+  .cmd-row-filters,
+  .cmd-view-controls,
+  .cmd-right-actions {
+    width: 100%;
+  }
+
+  .cmd-right-actions {
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+
+  .cp-grid-two {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 767px) {
+
+  .ws-root,
+  .ws-root.drawer-open {
+    grid-template-columns: 1fr;
+  }
+
+  .ws-rail {
+    border-right: 0;
+    border-bottom: 1px solid var(--line-subtle);
+  }
+
+  .rail-shell {
+    min-height: auto;
+    width: 100% !important;
+  }
+
+  .rail-shell.collapsed .rail-brand-text,
+  .rail-shell.collapsed .rail-profile,
+  .rail-shell.collapsed .rail-jump,
+  .rail-shell.collapsed .rail-title,
+  .rail-shell.collapsed .rail-history,
+  .rail-shell.collapsed .rail-footer {
+    display: none;
+  }
+
+  .ws-header {
+    padding: 10px;
+  }
+
+  .ws-canvas {
+    padding: 8px;
+  }
+
+  .ws-drawer.open {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    z-index: 70;
+  }
+
+  .cmd-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .cmd-search,
+  .search-wrap,
+  .search-input,
+  .view-select-wrap,
+  .cmd-view-controls,
+  .cmd-right-actions,
+  .cmd-right-actions .btn,
+  .cmd-panel-switch,
+  .cmd-row-actions-end {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .cmd-panel-switch .cmd-panel-btn {
+    flex: 1;
+  }
+
+  .cmd-row-chips {
+    align-items: stretch;
+  }
+
+  .chips-wrap {
+    width: 100%;
+  }
+
+  .modal-backdrop {
+    padding: 10px;
+  }
+
+  .import-drop {
+    grid-template-columns: 1fr;
+  }
+
+  .import-drop-cta {
+    justify-self: flex-start;
+  }
+
+  .import-drop-title {
+    white-space: normal;
+  }
+
+  .import-cta-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .rule-item-grid,
+  .rule-range-grid,
+  .cp-grid-two {
+    grid-template-columns: 1fr;
+  }
+
+  .dc-header-row {
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .table-size {
+    margin-left: 0;
+  }
+
+  .pnl-foot {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+}

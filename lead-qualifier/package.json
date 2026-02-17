@@ -1,0 +1,30 @@
+{
+  "name": "hound-suite-desktop",
+  "version": "0.1.0",
+  "description": "Hound Suite desktop shell with bundled FastAPI sidecar",
+  "main": "desktop/main.js",
+  "author": "Hound",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron ./desktop/main.js",
+    "build:sidecar": "node ./desktop/build-sidecar.js",
+    "build:mac": "node ./desktop/build-electron.js --mac dmg zip --publish never",
+    "build:win": "node ./desktop/build-electron.js --win nsis --publish never",
+    "build:all": "node ./desktop/build-electron.js --mac dmg zip --win nsis --publish never",
+    "package:mac": "npm run build:sidecar && npm run build:mac",
+    "package:win": "npm run build:sidecar && npm run build:win",
+    "package:all": "npm run build:sidecar && npm run build:all"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/example/hound-suite.git"
+  }
+}
