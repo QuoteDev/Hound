@@ -39,6 +39,7 @@ for (const command of candidates) {
     cwd: projectRoot,
     env,
     stdio: "inherit",
+    shell: process.platform === "win32",
   });
   if (!(result.error && result.error.code === "ENOENT")) break;
 }
