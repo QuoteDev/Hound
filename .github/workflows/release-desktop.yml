@@ -165,5 +165,10 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            release-artifacts/macos/**/*
-            release-artifacts/windows/**/*
+            release-artifacts/macos/**/*.dmg
+            release-artifacts/macos/**/*.zip
+            release-artifacts/macos/**/*.blockmap
+            release-artifacts/macos/**/latest-mac.yml
+            release-artifacts/windows/**/*.exe
+            release-artifacts/windows/**/*.blockmap
+            release-artifacts/windows/**/latest.yml
