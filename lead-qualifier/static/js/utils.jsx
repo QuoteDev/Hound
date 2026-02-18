@@ -12,6 +12,7 @@ const DrawerState = {
     FILTERS: 'filters',
     VALIDATION: 'validation',
     EXPORT: 'export',
+    ACTIVITY: 'activity',
     ROW_INSPECTOR: 'row_inspector',
 };
 
@@ -31,6 +32,7 @@ const VIEW_FILTER_OP_LABEL = VIEW_FILTER_OPS.reduce((acc, op) => {
 }, {});
 const FILTER_PRESETS_STORAGE_KEY = 'hound_filter_validation_presets_v1';
 const RECENT_RUNS_STORAGE_KEY = 'hound_recent_runs_v1';
+const WORKSPACE_RESTORE_STORAGE_KEY = 'hound_workspace_restore_v1';
 const MAX_RECENT_RUNS = 40;
 
 function TableViewState(raw = {}) {
@@ -179,6 +181,8 @@ function RowReason(code) {
         hubspot_duplicate_match: 'Found duplicate in attached dedupe files',
         preview_only: 'Preview row (qualification not run yet)',
         qualification_in_progress: 'Qualification currently running for this row.',
+        qualification_paused_pending: 'Qualification paused before this row was processed.',
+        paused_unprocessed: 'Qualification finished from paused state; row was auto-disqualified.',
     };
     if (!code) return 'No reason available';
     if (map[code]) return map[code];
@@ -226,11 +230,12 @@ function RowReason(code) {
 
 function RowStatusLabel(status) {
     const map = {
-        processing: 'Processing',
+        processing: 'Needs review',
         qualified: 'Qualified',
-        removed_filter: 'Disqualified by filters',
-        removed_domain: 'Disqualified by domain checks',
-        removed_hubspot: 'Disqualified as duplicate',
+        removed_filter: 'Excluded',
+        removed_domain: 'Excluded',
+        removed_hubspot: 'Excluded',
+        error: 'Error',
     };
     return map[status] || String(status || '').replaceAll('_', ' ');
 }
@@ -285,7 +290,9 @@ function FieldType({ name, inferredType }) {
 /* ── Match Type Options ───────────────────────────────────── */
 const MATCH_TYPES = [
     { value: 'contains', label: 'Contains' },
+    { value: 'not_contains', label: 'Does not contain' },
     { value: 'exact', label: 'Exact match' },
+    { value: 'not_exact', label: 'Not exact' },
     { value: 'fuzzy', label: 'Fuzzy match' },
     { value: 'range', label: 'Numeric range' },
     { value: 'dates', label: 'Date range' },
@@ -566,6 +573,29 @@ function _persistRecentRuns(runs) {
         return true;
     } catch (_e) {
         return false;
+    }
+}
+
+function saveWorkspaceRestoreState(payload) {
+    if (!_isBrowserStorageAvailable()) return false;
+    try {
+        window.localStorage.setItem(WORKSPACE_RESTORE_STORAGE_KEY, JSON.stringify(payload || {}));
+        return true;
+    } catch (_e) {
+        return false;
+    }
+}
+
+function loadWorkspaceRestoreState() {
+    if (!_isBrowserStorageAvailable()) return null;
+    try {
+        const raw = window.localStorage.getItem(WORKSPACE_RESTORE_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return null;
+        return parsed;
+    } catch (_e) {
+        return null;
     }
 }
 
@@ -900,7 +930,7 @@ function buildPayloadFromRules(rules) {
                 endDate: r.endDate,
             };
         }
-        const isContains = r.matchType === 'contains';
+        const isContains = r.matchType === 'contains' || r.matchType === 'not_contains';
         if (isContains && r.groups) {
             return {
                 field: r.field,
@@ -936,10 +966,36 @@ function normalizeLink(value, columnName = '') {
     return `https://${raw}`;
 }
 
-function renderTableCell(columnName, value) {
+function renderTableCell(columnName, value, format = 'auto') {
     if (value === null || value === undefined || value === '') return '';
     const raw = String(value || '').trim();
     const col = String(columnName || '').toLowerCase();
+    const normalizedFormat = String(format || 'auto').toLowerCase();
+
+    if (normalizedFormat === 'text') {
+        return String(value);
+    }
+
+    if (normalizedFormat === 'number' || normalizedFormat === 'currency') {
+        const parsed = parseFloat(raw.replace(/[^0-9.\-]/g, ''));
+        if (!Number.isNaN(parsed)) {
+            if (normalizedFormat === 'currency') {
+                return parsed.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+            }
+            return parsed.toLocaleString();
+        }
+    }
+
+    if (normalizedFormat === 'url') {
+        const href = normalizeLink(value, columnName);
+        if (href) {
+            return (
+                <a className="cell-link" href={href} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()}>
+                    {String(value)}
+                </a>
+            );
+        }
+    }
 
     if (raw.toLowerCase() === 'true' || raw.toLowerCase() === 'false') {
         return (

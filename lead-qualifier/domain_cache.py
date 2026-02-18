@@ -7,6 +7,7 @@ import aiosqlite
 from datetime import datetime, timedelta
 from typing import Optional
 import os
+import json
 from pathlib import Path
 
 
@@ -25,6 +26,7 @@ def _cache_db_path() -> str:
 # TTL settings
 VALID_DOMAIN_TTL_DAYS = 7  # Cache valid domains for 7 days
 DEAD_DOMAIN_TTL_HOURS = 24  # Cache dead domains for 24 hours
+HOMEPAGE_TTL_HOURS = 72  # Cache homepage scrape results for 3 days
 
 
 def _deserialize_ips(raw: Optional[str]) -> list[str]:
@@ -86,6 +88,19 @@ async def init_cache():
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_checked_at
             ON domain_cache(checked_at)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS homepage_cache (
+                cache_key TEXT PRIMARY KEY,
+                domain TEXT NOT NULL,
+                keywords_sig TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                checked_at TIMESTAMP NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_homepage_checked_at
+            ON homepage_cache(checked_at)
         """)
         await db.commit()
 
@@ -248,12 +263,17 @@ async def clear_expired_cache():
         now = datetime.now()
         valid_cutoff = (now - timedelta(days=VALID_DOMAIN_TTL_DAYS)).isoformat()
         dead_cutoff = (now - timedelta(hours=DEAD_DOMAIN_TTL_HOURS)).isoformat()
+        homepage_cutoff = (now - timedelta(hours=HOMEPAGE_TTL_HOURS)).isoformat()
 
         await db.execute("""
             DELETE FROM domain_cache
             WHERE (is_alive = 1 AND checked_at < ?)
                OR (is_alive = 0 AND checked_at < ?)
         """, (valid_cutoff, dead_cutoff))
+        await db.execute("""
+            DELETE FROM homepage_cache
+            WHERE checked_at < ?
+        """, (homepage_cutoff,))
 
         await db.commit()
 
@@ -262,6 +282,7 @@ async def clear_all_cache():
     """Clear all cached domain entries. Useful for manual cache invalidation."""
     async with aiosqlite.connect(_cache_db_path()) as db:
         await db.execute("DELETE FROM domain_cache")
+        await db.execute("DELETE FROM homepage_cache")
         await db.commit()
 
 
@@ -294,9 +315,93 @@ async def get_cache_stats() -> dict:
             row = await cursor.fetchone()
             expired = row["count"]
 
+        async with db.execute("SELECT COUNT(*) as count FROM homepage_cache") as cursor:
+            row = await cursor.fetchone()
+            homepage_total = row["count"]
+
+        homepage_cutoff = (now - timedelta(hours=HOMEPAGE_TTL_HOURS)).isoformat()
+        async with db.execute(
+            "SELECT COUNT(*) as count FROM homepage_cache WHERE checked_at < ?",
+            (homepage_cutoff,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            homepage_expired = row["count"]
+
         return {
             "total_entries": total,
             "alive_domains": breakdown.get("alive", 0),
             "dead_domains": breakdown.get("dead", 0),
-            "expired_entries": expired
+            "expired_entries": expired,
+            "homepage_entries": homepage_total,
+            "homepage_expired_entries": homepage_expired,
         }
+
+
+def _homepage_cache_key(domain: str, keywords_sig: str) -> str:
+    return f"{str(domain or '').strip().lower()}|{str(keywords_sig or '').strip()}"
+
+
+async def get_cached_homepages_batch(domains: list[str], keywords_sig: str) -> dict[str, dict]:
+    """
+    Retrieve cached homepage scrape results for a domain list + keyword signature.
+    Returns {domain: result_dict} for non-expired cache rows.
+    """
+    clean_domains = []
+    seen = set()
+    for domain in domains or []:
+        token = str(domain or "").strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        clean_domains.append(token)
+    if not clean_domains:
+        return {}
+
+    keys = [_homepage_cache_key(domain, keywords_sig) for domain in clean_domains]
+    placeholders = ",".join("?" * len(keys))
+    query = f"""
+        SELECT cache_key, domain, result_json, checked_at
+        FROM homepage_cache
+        WHERE cache_key IN ({placeholders})
+    """
+
+    out: dict[str, dict] = {}
+    now = datetime.now()
+    ttl = timedelta(hours=HOMEPAGE_TTL_HOURS)
+    async with aiosqlite.connect(_cache_db_path()) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, keys) as cursor:
+            async for row in cursor:
+                checked_at = _safe_parse_checked_at(row["checked_at"])
+                if not checked_at or (now - checked_at) > ttl:
+                    continue
+                try:
+                    parsed = json.loads(str(row["result_json"] or "{}"))
+                except Exception:
+                    continue
+                if isinstance(parsed, dict):
+                    out[str(row["domain"]).strip().lower()] = parsed
+    return out
+
+
+async def set_cached_homepage(domain: str, keywords_sig: str, result: dict):
+    """Store homepage scrape result under domain + keyword signature."""
+    clean_domain = str(domain or "").strip().lower()
+    if not clean_domain:
+        return
+    payload = result if isinstance(result, dict) else {}
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    key = _homepage_cache_key(clean_domain, keywords_sig)
+    async with aiosqlite.connect(_cache_db_path()) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO homepage_cache
+            (cache_key, domain, keywords_sig, result_json, checked_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            key,
+            clean_domain,
+            str(keywords_sig or "").strip(),
+            encoded,
+            datetime.now().isoformat(),
+        ))
+        await db.commit()

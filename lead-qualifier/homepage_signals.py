@@ -8,12 +8,14 @@ import asyncio
 import json
 import re
 from typing import Callable, Optional
+import hashlib
 
 import dns.asyncresolver
 import dns.exception
 import dns.resolver
 import httpx
 from bs4 import BeautifulSoup
+from domain_cache import init_cache, get_cached_homepages_batch, set_cached_homepage
 
 
 DEFAULT_HOMEPAGE_TIMEOUT_SECONDS = 6.0
@@ -452,19 +454,45 @@ async def collect_homepage_signals_batch(
     concurrency: int = DEFAULT_HOMEPAGE_CONCURRENCY,
     timeout_seconds: float = DEFAULT_HOMEPAGE_TIMEOUT_SECONDS,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    result_callback: Optional[Callable[[str, dict], None]] = None,
 ) -> dict[str, dict]:
     if not domains:
         return {}
+
+    await init_cache()
 
     normalized_keywords = [
         str(word or "").strip().lower()
         for word in (website_keywords or [])
         if str(word or "").strip()
     ]
+    keywords_sig = hashlib.sha1("\x1f".join(normalized_keywords).encode("utf-8")).hexdigest()
 
-    unique_domains = list(dict.fromkeys([str(d) for d in domains if str(d or "").strip()]))
+    unique_domains: list[str] = []
+    seen_domains: set[str] = set()
+    for value in domains:
+        clean = _normalize_domain(str(value or ""))
+        if not clean or clean in seen_domains:
+            continue
+        seen_domains.add(clean)
+        unique_domains.append(clean)
     if not unique_domains:
         return {}
+
+    cached = await get_cached_homepages_batch(unique_domains, keywords_sig=keywords_sig)
+    out: dict[str, dict] = {str(domain): result for domain, result in cached.items() if isinstance(result, dict)}
+    if result_callback:
+        for domain, result in out.items():
+            result_callback(domain, result)
+    fetch_domains = [domain for domain in unique_domains if domain not in out]
+    total = len(unique_domains)
+    processed = len(out)
+    if progress_callback:
+        progress_callback(processed, total)
+
+    if not fetch_domains:
+        return out
 
     max_connections = min(max(int(concurrency or DEFAULT_HOMEPAGE_CONCURRENCY), 20), 120)
     sem = asyncio.Semaphore(max_connections)
@@ -487,17 +515,28 @@ async def collect_homepage_signals_batch(
                     website_keywords=normalized_keywords,
                 )
 
-        tasks = [asyncio.create_task(_bounded(domain)) for domain in unique_domains]
-        out: dict[str, dict] = {}
-        total = len(tasks)
-        processed = 0
+        tasks = [asyncio.create_task(_bounded(domain)) for domain in fetch_domains]
+        pending = set(tasks)
         for future in asyncio.as_completed(tasks):
+            if should_stop and should_stop():
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                break
             try:
                 result = await future
                 if isinstance(result, dict) and result.get("domain") is not None:
-                    out[str(result["domain"])] = result
+                    domain = str(result["domain"])
+                    out[domain] = result
+                    await set_cached_homepage(domain=domain, keywords_sig=keywords_sig, result=result)
+                    if result_callback:
+                        result_callback(domain, result)
             except Exception:
                 pass
+            finally:
+                pending.discard(future)
 
             processed += 1
             if progress_callback:

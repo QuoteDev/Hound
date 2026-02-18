@@ -5,9 +5,10 @@ function WorkspaceShell({
     mainContent,
     drawer,
     drawerOpen,
+    railExpanded,
 }) {
     return (
-        <div className={`ws-root ${drawerOpen ? 'drawer-open' : ''}`}>
+        <div className={`ws-root ${drawerOpen ? 'drawer-open' : ''} ${railExpanded ? 'rail-expanded' : ''}`}>
             <aside className="ws-rail">
                 {leftRail}
             </aside>

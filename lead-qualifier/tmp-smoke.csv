@@ -1,0 +1,5 @@
+company,domain,employees,revenue,status
+Acme,acme.com,12,120000,active
+Beta,beta.io,45,980000,trial
+Gamma,gamma.org,8,45000,inactive
+Delta,delta.ai,120,4500000,active

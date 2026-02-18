@@ -7,12 +7,20 @@ function DataCanvas({
     viewSort,
     onViewSort,
     viewFilters,
+    onAddViewFilter,
     selectedRowId,
     onSelectRow,
+    columnPrefs,
+    onHideColumn,
+    onShowAllColumns,
+    onRenameColumn,
+    onFormatColumn,
 }) {
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(100);
     const [selectedCell, setSelectedCell] = useState(null);
+    const [checkedRows, setCheckedRows] = useState({});
+    const headerCheckboxRef = useRef(null);
 
     const [previewRows, setPreviewRows] = useState([]);
     const [previewMeta, setPreviewMeta] = useState({
@@ -25,6 +33,11 @@ function DataCanvas({
     const isReviewData = !!runSummary;
     const runProgressSignal = `${runProgress?.status || ''}:${runProgress?.stage || ''}:${runProgress?.processedRows || 0}:${runProgress?.qualifiedCount || 0}:${runProgress?.removedCount || 0}`;
     const columns = isReviewData ? (runSummary.columns || []) : (session?.columns || []).map(c => c.name);
+    const hiddenColumns = columnPrefs?.hidden || {};
+    const columnLabels = columnPrefs?.labels || {};
+    const columnFormats = columnPrefs?.formats || {};
+    const visibleColumns = columns.filter(col => !hiddenColumns[col]);
+    const hiddenCount = columns.length - visibleColumns.length;
 
     const profileByName = useMemo(() => {
         const out = {};
@@ -171,6 +184,10 @@ function DataCanvas({
         setSelectedCell(null);
     }, [viewSearch, JSON.stringify(viewFilters), viewSort?.column, viewSort?.direction, page, pageSize]);
 
+    useEffect(() => {
+        setCheckedRows({});
+    }, [viewSearch, JSON.stringify(viewFilters), viewSort?.column, viewSort?.direction, page, pageSize, isReviewData]);
+
     const toggleSort = (col) => {
         const activeCol = viewSort?.column;
         const activeDir = viewSort?.direction;
@@ -183,17 +200,86 @@ function DataCanvas({
         }
     };
 
+    const displayColumnName = (col) => columnLabels[col] || col;
+    const getColumnFormat = (col) => columnFormats[col] || 'auto';
+
+    const handleHeaderFilter = (columnName) => {
+        if (typeof onAddViewFilter !== 'function') return;
+        const promptValue = typeof window !== 'undefined'
+            ? window.prompt(`Filter "${displayColumnName(columnName)}" contains:`)
+            : '';
+        if (promptValue === null) return;
+        onAddViewFilter({
+            field: columnName,
+            op: 'contains',
+            value: String(promptValue || '').trim(),
+        });
+    };
+
+    const handleHeaderHide = (columnName) => {
+        if (typeof onHideColumn !== 'function') return;
+        onHideColumn(columnName);
+    };
+
+    const handleHeaderRename = (columnName) => {
+        if (typeof onRenameColumn !== 'function') return;
+        const current = displayColumnName(columnName);
+        const next = typeof window !== 'undefined'
+            ? window.prompt(`Rename column "${current}"`, current)
+            : current;
+        if (next === null) return;
+        onRenameColumn(columnName, next);
+    };
+
+    const handleFormatChange = (columnName, format) => {
+        if (typeof onFormatColumn !== 'function') return;
+        onFormatColumn(columnName, format);
+    };
+
+    const handleShowAllColumns = () => {
+        if (typeof onShowAllColumns === 'function') onShowAllColumns();
+    };
+
     const SortIcon = ({ col }) => {
         if (viewSort?.column !== col || !viewSort?.direction) return <span className="sort-arrow sort-idle"><I.chevDown /></span>;
         return <span className="sort-arrow sort-active">{viewSort.direction === 'asc' ? <I.arrowUp /> : <I.arrowDown />}</span>;
     };
 
-    const statusLabels = {
-        processing: 'Processing',
-        qualified: 'Qualified',
-        removed_filter: 'Removed · filter',
-        removed_domain: 'Removed · domain',
-        removed_hubspot: 'Removed · hubspot',
+    const statusMap = {
+        processing: { label: 'Needs review', tone: 'review', icon: <I.info /> },
+        qualified: { label: 'Qualified', tone: 'qualified', icon: <I.check /> },
+        removed_filter: { label: 'Excluded', tone: 'excluded', icon: <I.x /> },
+        removed_domain: { label: 'Excluded', tone: 'excluded', icon: <I.x /> },
+        removed_hubspot: { label: 'Excluded', tone: 'excluded', icon: <I.x /> },
+    };
+
+    const rowIdsOnPage = currentRows.map((row, idx) => row._rowId ?? `${safePage}-${idx}`);
+    const allOnPageChecked = rowIdsOnPage.length > 0 && rowIdsOnPage.every(rowId => !!checkedRows[rowId]);
+    const someOnPageChecked = rowIdsOnPage.some(rowId => !!checkedRows[rowId]);
+
+    useEffect(() => {
+        if (!headerCheckboxRef.current) return;
+        headerCheckboxRef.current.indeterminate = !allOnPageChecked && someOnPageChecked;
+    }, [allOnPageChecked, someOnPageChecked]);
+
+    const toggleRowChecked = (rowId, checked) => {
+        setCheckedRows(curr => {
+            const next = { ...curr };
+            if (checked) next[rowId] = true;
+            else delete next[rowId];
+            return next;
+        });
+    };
+
+    const togglePageChecked = (checked) => {
+        setCheckedRows(curr => {
+            const next = { ...curr };
+            rowIdsOnPage.forEach(rowId => {
+                if (checked) next[rowId] = true;
+                else delete next[rowId];
+            });
+            return next;
+        });
     };
 
     return (
@@ -201,6 +287,11 @@ function DataCanvas({
             <div className="dc-header-row">
                 <span className="tb-item">{rowsShownCount.toLocaleString()} shown</span>
                 <span className="tb-item">{totalRowsCount.toLocaleString()} total</span>
+                {hiddenCount > 0 && (
+                    <button className="btn btn-t" type="button" onClick={handleShowAllColumns}>
+                        Show {hiddenCount} hidden {hiddenCount === 1 ? 'column' : 'columns'}
+                    </button>
+                )}
                 {!isReviewData && previewMeta.loading && <span className="tb-item muted">Loading…</span>}
                 {!isReviewData && runProgress?.status === 'running' && (
                     <span className="tb-item tb-item-accent">
@@ -227,54 +318,136 @@ function DataCanvas({
                     <h3>No dataset loaded</h3>
                     <p>Import a dataset to begin qualification and table exploration.</p>
                 </div>
+            ) : visibleColumns.length === 0 ? (
+                <div className="empty">
+                    <I.columns style={{ width: 28, height: 28 }} />
+                    <h3>All columns are hidden</h3>
+                    <p>Use Show columns to restore the table layout.</p>
+                    <button className="btn btn-g" type="button" onClick={handleShowAllColumns}>Show columns</button>
+                </div>
             ) : (
                 <>
                     <div className="tw results-table-wrap">
                         <table>
                             <thead>
                                 <tr>
+                                    <th style={{ width: '36px' }} className="th-check">
+                                        <input
+                                            ref={headerCheckboxRef}
+                                            type="checkbox"
+                                            checked={allOnPageChecked}
+                                            onChange={e => togglePageChecked(e.target.checked)}
+                                            aria-label="Select all rows on page"
+                                        />
+                                    </th>
                                     <th style={{ width: '56px' }}>#</th>
-                                    <th style={{ width: '138px' }}>Status</th>
-                                    {columns.map(col => (
+                                    <th style={{ width: '108px' }}>Status</th>
+                                    {visibleColumns.map(col => (
                                         <th key={col} className="th-sort">
-                                            <button type="button" className="th-btn" onClick={() => toggleSort(col)} aria-label={`Sort by ${col}`}>
-                                                <FieldType name={col} inferredType={profileByName[col]?.inferredType} /> {col} <SortIcon col={col} />
-                                            </button>
+                                            <div className="th-head">
+                                                <button type="button" className="th-btn" onClick={() => toggleSort(col)} aria-label={`Sort by ${displayColumnName(col)}`}>
+                                                    <span className="th-label"><FieldType name={col} inferredType={profileByName[col]?.inferredType} /> {displayColumnName(col)}</span>
+                                                    <SortIcon col={col} />
+                                                </button>
+                                                <details className="menu-wrap th-menu-wrap">
+                                                    <summary className="th-menu-btn" aria-label={`Column menu for ${displayColumnName(col)}`}>
+                                                        <I.moreH />
+                                                    </summary>
+                                                    <div className="menu-panel th-menu-panel">
+                                                        <button className="menu-item" type="button" onClick={() => onViewSort({ column: col, direction: 'asc' })}>
+                                                            <I.arrowUp /> Sort ascending
+                                                        </button>
+                                                        <button className="menu-item" type="button" onClick={() => onViewSort({ column: col, direction: 'desc' })}>
+                                                            <I.arrowDown /> Sort descending
+                                                        </button>
+                                                        <button className="menu-item" type="button" onClick={() => handleHeaderFilter(col)}>
+                                                            <I.filter /> Filter values
+                                                        </button>
+                                                        <button className="menu-item" type="button" onClick={() => handleHeaderHide(col)}>
+                                                            <I.x /> Hide column
+                                                        </button>
+                                                        <button className="menu-item" type="button" onClick={() => handleHeaderRename(col)}>
+                                                            <I.edit /> Rename column
+                                                        </button>
+                                                        <label className="th-menu-format">
+                                                            <span>Format</span>
+                                                            <select value={getColumnFormat(col)} onChange={e => handleFormatChange(col, e.target.value)}>
+                                                                <option value="auto">Auto</option>
+                                                                <option value="text">Text</option>
+                                                                <option value="number">Number</option>
+                                                                <option value="currency">Currency</option>
+                                                                <option value="url">URL</option>
+                                                            </select>
+                                                        </label>
+                                                    </div>
+                                                </details>
+                                            </div>
                                         </th>
                                     ))}
                                 </tr>
                             </thead>
                             <tbody>
+                                <tr className="meta-row" aria-hidden="true">
+                                    <td className="row-check" />
+                                    <td className="rn rn-meta">%</td>
+                                    <td>
+                                        <span className="meta-status-chip">
+                                            <I.check />
+                                            <span>Up to date</span>
+                                        </span>
+                                    </td>
+                                    {visibleColumns.map(col => (
+                                        <td key={`${col}-meta`}>
+                                            <span className="meta-col-check"><I.check /></span>
+                                        </td>
+                                    ))}
+                                </tr>
                                 {currentRows.map((row, idx) => {
                                     const status = row._rowStatus || RowStatus.QUALIFIED;
                                     const rowId = row._rowId ?? `${safePage}-${idx}`;
+                                    const statusMeta = statusMap[status] || { label: 'Error', tone: 'error', icon: <I.alertTri /> };
                                     return (
                                         <tr
                                             key={rowId}
                                             className={`row-${status} ${String(status || '').startsWith('removed_') ? 'row-removed' : ''} ${selectedRowId === rowId ? 'row-selected' : ''}`}
-                                            onClick={() => onSelectRow({ ...row, _rowId: rowId })}
+                                            onClick={() => onSelectRow({ ...row, _rowId: rowId }, { openInspector: false })}
+                                            onDoubleClick={() => onSelectRow({ ...row, _rowId: rowId }, { openInspector: true })}
                                             onKeyDown={(event) => {
                                                 if (event.key === 'Enter' || event.key === ' ') {
                                                     event.preventDefault();
-                                                    onSelectRow({ ...row, _rowId: rowId });
+                                                    onSelectRow({ ...row, _rowId: rowId }, { openInspector: false });
                                                 }
                                             }}
                                             tabIndex={0}
                                         >
+                                            <td className="row-check">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={!!checkedRows[rowId]}
+                                                    onClick={event => event.stopPropagation()}
+                                                    onChange={e => toggleRowChecked(rowId, e.target.checked)}
+                                                    aria-label={`Select row ${pageStart + idx + 1}`}
+                                                />
+                                            </td>
                                             <td className="rn">{pageStart + idx + 1}</td>
-                                            <td><span className={`status-chip ${status}`}>{statusLabels[status] || status.replaceAll('_', ' ')}</span></td>
-                                            {columns.map(col => (
+                                            <td>
+                                                <span className={`status-chip status-${statusMeta.tone}`}>
+                                                    <span className="status-chip-icon">{statusMeta.icon}</span>
+                                                    <span>{statusMeta.label}</span>
+                                                </span>
+                                            </td>
+                                            {visibleColumns.map(col => (
                                                 <td
                                                     key={col}
                                                     title={row[col]}
-                                                    className={selectedCell?.rowId === rowId && selectedCell?.column === col ? 'cell-selected' : ''}
+                                                    className={`${selectedCell?.rowId === rowId && selectedCell?.column === col ? 'cell-selected' : ''} ${((getColumnFormat(col) === 'number' || getColumnFormat(col) === 'currency') || (getColumnFormat(col) === 'auto' && profileByName[col]?.inferredType === 'number')) ? 'cell-num' : ''}`}
                                                     onClick={(event) => {
                                                         event.stopPropagation();
                                                         setSelectedCell({ rowId, column: col });
-                                                        onSelectRow({ ...row, _rowId: rowId });
+                                                        onSelectRow({ ...row, _rowId: rowId }, { openInspector: false });
                                                     }}
                                                 >
-                                                    {renderTableCell(col, row[col])}
+                                                    {renderTableCell(col, row[col], getColumnFormat(col))}
                                                 </td>
                                             ))}
                                         </tr>
@@ -288,6 +461,17 @@ function DataCanvas({
                         <div className="btn-row">
                             <button className="btn btn-g" disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}>Previous</button>
                             <button className="btn btn-g" disabled={safePage >= totalPages} onClick={() => setPage(safePage + 1)}>Next</button>
+                        </div>
+                    </div>
+                    <div className="sheet-strip">
+                        <div className="sheet-strip-left">
+                            <button className="sheet-link" type="button">Overview</button>
+                            <button className="sheet-tab active" type="button">{session?.fileName || 'Table'}</button>
+                            <button className="sheet-add" type="button"><I.plus /> Add</button>
+                        </div>
+                        <div className="sheet-strip-right">
+                            <span>{Math.max(1, Math.round(((pageStart + currentRows.length) / Math.max(1, rowsShownCount || totalRowsCount)) * 100))}% of table completed</span>
+                            <button className="sheet-history" type="button">History</button>
                         </div>
                     </div>
                 </>

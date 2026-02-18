@@ -222,6 +222,34 @@ function createMainWindow() {
         },
     });
 
+    // Force consistent desktop layout: keep Chromium zoom at 100%.
+    try {
+        mainWindow.webContents.setZoomFactor(1);
+        mainWindow.webContents.setZoomLevel(0);
+        mainWindow.webContents.setVisualZoomLevelLimits(1, 1).catch(() => { });
+    } catch (_e) {
+        // Best effort only.
+    }
+
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+        const key = String(input?.key || '').toLowerCase();
+        const isModifier = !!(input?.control || input?.meta);
+        const isZoomKey = key === '+' || key === '=' || key === '-' || key === '_';
+        const isResetKey = key === '0';
+        if (isModifier && (isZoomKey || isResetKey)) {
+            event.preventDefault();
+        }
+    });
+
+    mainWindow.webContents.on('did-finish-load', () => {
+        try {
+            mainWindow?.webContents.setZoomFactor(1);
+            mainWindow?.webContents.setZoomLevel(0);
+        } catch (_e) {
+            // Best effort only.
+        }
+    });
+
     const appUrl = `http://${BACKEND_HOST}:${backendPort}/static/index.html`;
     log('window:load-url', { appUrl });
     mainWindow.loadURL(appUrl);

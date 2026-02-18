@@ -36,6 +36,13 @@ from rapidfuzz import fuzz
 from domain_validator import check_domains_dns_batch, get_cdn_reference_data
 from domain_cache import init_cache, get_cache_stats, clear_all_cache
 from homepage_signals import collect_homepage_signals_batch
+from scraper.pipeline import (
+    Target as ScrapeTarget,
+    build_paths as build_scrape_paths,
+    run_phase1_async as run_scrape_phase1_async,
+    run_phase2_fallback as run_scrape_phase2_fallback,
+    extract_keywords as extract_scrape_keywords,
+)
 
 app = FastAPI(title="Kennel — Hound Suite")
 
@@ -63,9 +70,10 @@ APP_BOOT_TS = time.time()
 
 
 def _refresh_data_paths_from_env() -> None:
-    global DATA_DIR, SESSION_STORE_DIR
+    global DATA_DIR, SESSION_STORE_DIR, SCRAPE_JOB_DIR
     DATA_DIR = _resolve_data_dir_from_env()
     SESSION_STORE_DIR = DATA_DIR / "session_store"
+    SCRAPE_JOB_DIR = DATA_DIR / "scrape_jobs"
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB limit (supports 600k+ rows)
@@ -87,6 +95,30 @@ B2B_SCORE_COLUMN = "b2b_score"
 US_SIGNALS_COLUMN = "us_signals"
 WEBSITE_KEYWORDS_MATCH_COLUMN = "website_keywords_match"
 HOMEPAGE_STATUS_COLUMN = "homepage_status"
+SCRAPE_JOB_DIR = DATA_DIR / "scrape_jobs"
+SCRAPE_PHASE1_CONCURRENCY = int(os.getenv("HOUND_SCRAPE_PHASE1_CONCURRENCY", "700"))
+SCRAPE_PHASE1_TIMEOUT = float(os.getenv("HOUND_SCRAPE_PHASE1_TIMEOUT", "5.0"))
+SCRAPE_PHASE1_RETRY = int(os.getenv("HOUND_SCRAPE_PHASE1_RETRY", "1"))
+SCRAPE_PHASE2_CONCURRENCY = int(os.getenv("HOUND_SCRAPE_PHASE2_CONCURRENCY", "40"))
+SCRAPE_PHASE2_TIMEOUT = float(os.getenv("HOUND_SCRAPE_PHASE2_TIMEOUT", "10.0"))
+SCRAPE_KEYWORD_TOP_K = int(os.getenv("HOUND_SCRAPE_KEYWORD_TOP_K", "20"))
+SCRAPE_COLUMN_MAP = {
+    "domain": "scrape_domain",
+    "url": "scrape_url",
+    "status": "scrape_status",
+    "http_status": "scrape_http_status",
+    "title": "scrape_title",
+    "meta_description": "scrape_meta_description",
+    "og_title": "scrape_og_title",
+    "og_description": "scrape_og_description",
+    "h1_h3": "scrape_h1_h3",
+    "body_text": "scrape_body_text",
+    "scraped_at": "scrape_scraped_at",
+    "error": "scrape_error",
+    "phase": "scrape_phase",
+    "scraped_keywords": "scrape_keywords",
+}
+SCRAPE_ENRICH_COLUMNS = list(SCRAPE_COLUMN_MAP.values())
 
 
 @app.get("/")
@@ -131,6 +163,7 @@ def _prepare_runtime_data_layout() -> None:
     _refresh_data_paths_from_env()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SESSION_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    SCRAPE_JOB_DIR.mkdir(parents=True, exist_ok=True)
     os.environ["HOUND_DATA_DIR"] = str(DATA_DIR)
 
     if DATA_DIR == APP_BASE_DIR:
@@ -752,10 +785,13 @@ def _compact_run_snapshot(run: Optional[dict], now: Optional[float] = None) -> O
         }),
         "startedAt": run.get("startedAt"),
         "finishedAt": run.get("finishedAt"),
+        "pausedAt": run.get("pausedAt"),
+        "pauseRequested": bool(run.get("pauseRequested")),
+        "finishOnPause": bool(run.get("finishOnPause")),
         "error": run.get("error", ""),
     }
 
-    if status == "running":
+    if status in {"running", "pausing"}:
         compact.update({
             "status": "error",
             "stage": "error",
@@ -765,7 +801,7 @@ def _compact_run_snapshot(run: Optional[dict], now: Optional[float] = None) -> O
             "finishedAt": timestamp,
         })
 
-    if status == "running":
+    if status in {"running", "pausing", "paused"}:
         for key in (
             "qualifiedIds",
             "removedFilterIds",
@@ -791,6 +827,42 @@ def _compact_run_snapshot(run: Optional[dict], now: Optional[float] = None) -> O
     return compact
 
 
+def _compact_scrape_snapshot(scrape: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
+    if not isinstance(scrape, dict):
+        return None
+
+    timestamp = now or time.time()
+    status = str(scrape.get("status") or "idle")
+    compact = {
+        "scrapeId": scrape.get("scrapeId"),
+        "status": status,
+        "stage": scrape.get("stage", "idle"),
+        "progress": float(scrape.get("progress", 0.0)),
+        "message": scrape.get("message", ""),
+        "processed": int(scrape.get("processed", 0)),
+        "total": int(scrape.get("total", 0)),
+        "ok": int(scrape.get("ok", 0)),
+        "fail": int(scrape.get("fail", 0)),
+        "ratePerSec": float(scrape.get("ratePerSec", 0.0)),
+        "domainField": scrape.get("domainField", ""),
+        "outputDir": scrape.get("outputDir", ""),
+        "startedAt": scrape.get("startedAt"),
+        "finishedAt": scrape.get("finishedAt"),
+        "error": scrape.get("error", ""),
+        "result": scrape.get("result"),
+    }
+    if status == "running":
+        compact.update({
+            "status": "error",
+            "stage": "error",
+            "progress": 1.0,
+            "message": "Scrape job was interrupted when the server restarted.",
+            "error": "interrupted_by_restart",
+            "finishedAt": timestamp,
+        })
+    return compact
+
+
 def _serialize_session_for_disk(session_id: str, session: dict) -> dict:
     source_raws = [raw for raw in (session.get("sourceRaws") or []) if raw]
     csv_raw = session.get("csvRaw")
@@ -805,6 +877,7 @@ def _serialize_session_for_disk(session_id: str, session: dict) -> dict:
     return {
         "sessionId": session_id,
         "csvRaw": csv_raw,
+        "dfParquet": session.get("dfParquet"),
         "fileName": session.get("fileName"),
         "sourceFileNames": list(session.get("sourceFileNames") or []),
         "sourceRaws": source_raws,
@@ -820,7 +893,9 @@ def _serialize_session_for_disk(session_id: str, session: dict) -> dict:
         "dedupeRaws": dedupe_raws,
         "dedupeMapping": list(session.get("dedupeMapping") or []),
         "dedupeSourceRows": int(session.get("dedupeSourceRows") or 0),
+        "workspaceConfig": dict(session.get("workspaceConfig") or {}),
         "activeRun": _compact_run_snapshot(session.get("activeRun")),
+        "activeScrape": _compact_scrape_snapshot(session.get("activeScrape")),
         "lastRunStatus": session.get("lastRunStatus"),
         "createdAt": float(session.get("createdAt") or time.time()),
         "updatedAt": float(session.get("updatedAt") or time.time()),
@@ -883,6 +958,7 @@ def _load_persisted_sessions() -> None:
 
         SESSION_STORE[session_id] = {
             "csvRaw": payload.get("csvRaw"),
+            "dfParquet": payload.get("dfParquet"),
             "df": None,
             "fileName": payload.get("fileName") or "dataset.csv",
             "sourceFileNames": list(payload.get("sourceFileNames") or []),
@@ -900,7 +976,9 @@ def _load_persisted_sessions() -> None:
             "dedupeMapping": list(payload.get("dedupeMapping") or []),
             "dedupeSourceRows": int(payload.get("dedupeSourceRows") or 0),
             "dedupeDf": None,
+            "workspaceConfig": dict(payload.get("workspaceConfig") or {}),
             "activeRun": _compact_run_snapshot(payload.get("activeRun"), now=now),
+            "activeScrape": _compact_scrape_snapshot(payload.get("activeScrape"), now=now),
             "lastRunResult": None,
             "lastRunStatus": payload.get("lastRunStatus"),
             "createdAt": float(payload.get("createdAt") or updated_at),
@@ -941,6 +1019,7 @@ def _put_session(
     now = time.time()
     SESSION_STORE[sid] = {
         "csvRaw": raw_csv,
+        "dfParquet": None,
         "df": df,
         "fileName": file_name,
         "sourceFileNames": list(source_file_names or ([file_name] if file_name else [])),
@@ -958,7 +1037,9 @@ def _put_session(
         "dedupeMapping": list(dedupe_mapping or []),
         "dedupeSourceRows": int(dedupe_source_rows if dedupe_source_rows is not None else (dedupe_df.height if isinstance(dedupe_df, pl.DataFrame) else 0)),
         "dedupeDf": dedupe_df,
+        "workspaceConfig": {},
         "activeRun": None,
+        "activeScrape": None,
         "lastRunResult": None,
         "lastRunStatus": None,
         "createdAt": now,
@@ -1000,10 +1081,49 @@ def _set_session_dedupe(
     return session
 
 
+def _dataframe_to_parquet_bytes(df: pl.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    df.write_parquet(buf, compression="zstd")
+    return buf.getvalue()
+
+
+def _refresh_session_dataframe_metadata(session: dict, df: pl.DataFrame) -> None:
+    columns_info, column_profiles = build_columns_info(df)
+    session["columns"] = columns_info
+    session["columnProfiles"] = column_profiles
+    session["previewRows"] = df.head(PREVIEW_ROW_LIMIT).to_dicts()
+    session["anomalies"] = build_column_anomalies(column_profiles, df.height)
+
+
+def _replace_session_dataframe(session: dict, df: pl.DataFrame) -> None:
+    session["df"] = df
+    try:
+        session["dfParquet"] = _dataframe_to_parquet_bytes(df)
+    except Exception:
+        session["dfParquet"] = None
+        traceback.print_exc()
+    _refresh_session_dataframe_metadata(session, df)
+    if not session.get("sourceRows"):
+        session["sourceRows"] = int(df.height)
+
+
 def _get_session_df(session: dict) -> pl.DataFrame:
     """Get cached parsed source dataframe, parsing once if needed."""
     if isinstance(session.get("df"), pl.DataFrame):
         return session["df"]
+    parquet_raw = session.get("dfParquet")
+    if parquet_raw:
+        try:
+            df = pl.read_parquet(io.BytesIO(parquet_raw))
+            session["df"] = df
+            if not session.get("sourceRows"):
+                session["sourceRows"] = int(df.height)
+            if not session.get("columns") or not session.get("columnProfiles"):
+                _refresh_session_dataframe_metadata(session, df)
+                session["updatedAt"] = time.time()
+            return df
+        except Exception:
+            traceback.print_exc()
     source_raws = [raw for raw in (session.get("sourceRaws") or []) if raw]
     if len(source_raws) > 1:
         parsed = [{
@@ -1021,16 +1141,15 @@ def _get_session_df(session: dict) -> pl.DataFrame:
         df, mapping = merge_dataframes_with_schema_mapping(parsed)
         session["sourceMapping"] = mapping
     else:
-        df = read_csv_bytes(session["csvRaw"])
+        csv_raw = session.get("csvRaw")
+        if not csv_raw:
+            raise HTTPException(status_code=500, detail="Session source data is unavailable.")
+        df = read_csv_bytes(csv_raw)
     session["df"] = df
     if not session.get("sourceRows"):
         session["sourceRows"] = int(df.height)
     if not session.get("columns") or not session.get("columnProfiles"):
-        columns_info, column_profiles = build_columns_info(df)
-        session["columns"] = columns_info
-        session["columnProfiles"] = column_profiles
-        session["previewRows"] = df.head(PREVIEW_ROW_LIMIT).to_dicts()
-        session["anomalies"] = build_column_anomalies(column_profiles, df.height)
+        _refresh_session_dataframe_metadata(session, df)
         session["updatedAt"] = time.time()
     return df
 
@@ -1138,11 +1257,15 @@ def _build_session_payload(session_id: str, session: dict) -> dict[str, Any]:
         "sourceRows": int(session.get("sourceRows") or source_df.height),
         "sourceMappings": list(session.get("sourceMapping") or []),
         "anomalies": dict(session.get("anomalies") or {}),
+        "workspaceConfig": dict(session.get("workspaceConfig") or {}),
         "dedupe": dedupe_payload,
     }
     active_run = _serialize_run_snapshot(session.get("activeRun"), include_result=False)
     if active_run.get("status") != "idle":
         payload["activeRun"] = active_run
+    active_scrape = _serialize_scrape_snapshot(session.get("activeScrape"), include_result=False)
+    if active_scrape.get("status") != "idle":
+        payload["activeScrape"] = active_scrape
     return payload
 
 
@@ -1210,6 +1333,9 @@ def _serialize_run_snapshot(run: Optional[dict], include_result: bool = True) ->
                 "removedHubspot": 0,
             },
             "completed": True,
+            "pauseRequested": False,
+            "finishOnPause": False,
+            "pausedAt": None,
             "error": "",
         }
 
@@ -1229,12 +1355,56 @@ def _serialize_run_snapshot(run: Optional[dict], include_result: bool = True) ->
             "removedHubspot": 0,
         }),
         "completed": run.get("status") in ("done", "error"),
+        "pauseRequested": bool(run.get("pauseRequested")),
+        "finishOnPause": bool(run.get("finishOnPause")),
+        "pausedAt": run.get("pausedAt"),
         "error": run.get("error", ""),
         "startedAt": run.get("startedAt"),
         "finishedAt": run.get("finishedAt"),
     }
     if include_result and run.get("status") == "done" and isinstance(run.get("result"), dict):
         payload["result"] = run["result"]
+    return payload
+
+
+def _serialize_scrape_snapshot(scrape: Optional[dict], include_result: bool = True) -> dict:
+    if not isinstance(scrape, dict):
+        return {
+            "status": "idle",
+            "stage": "idle",
+            "progress": 0.0,
+            "message": "",
+            "processed": 0,
+            "total": 0,
+            "ok": 0,
+            "fail": 0,
+            "ratePerSec": 0.0,
+            "domainField": "",
+            "outputDir": "",
+            "completed": True,
+            "error": "",
+        }
+
+    payload = {
+        "scrapeId": scrape.get("scrapeId"),
+        "status": scrape.get("status", "idle"),
+        "stage": scrape.get("stage", "idle"),
+        "progress": float(scrape.get("progress", 0.0)),
+        "message": scrape.get("message", ""),
+        "processed": int(scrape.get("processed", 0)),
+        "total": int(scrape.get("total", 0)),
+        "ok": int(scrape.get("ok", 0)),
+        "fail": int(scrape.get("fail", 0)),
+        "ratePerSec": float(scrape.get("ratePerSec", 0.0)),
+        "domainField": scrape.get("domainField", ""),
+        "outputDir": scrape.get("outputDir", ""),
+        "completed": scrape.get("status") in ("done", "error"),
+        "error": scrape.get("error", ""),
+        "startedAt": scrape.get("startedAt"),
+        "finishedAt": scrape.get("finishedAt"),
+    }
+    if include_result and scrape.get("status") == "done" and isinstance(scrape.get("result"), dict):
+        payload["result"] = scrape["result"]
     return payload
 
 
@@ -1260,8 +1430,10 @@ def _resolve_row_annotation(row_id: int, run_state: Optional[dict]) -> tuple[str
     if row_id in qualified_ids:
         return "qualified", ["qualified_passed_all_checks"]
 
-    if run_status == "running":
+    if run_status in {"running", "pausing"}:
         return "processing", ["qualification_in_progress"]
+    if run_status == "paused":
+        return "processing", ["qualification_paused_pending"]
     if run_status == "done":
         return "removed_filter", ["rule_filter_mismatch"]
     return "qualified", ["preview_only"]
@@ -1312,13 +1484,17 @@ def _domain_result_resolved_ips_csv(result: Optional[dict]) -> str:
 
 
 def _build_resolved_ips_expr(domain_field: str, domain_results: dict) -> pl.Expr:
+    def _lookup_result(domain_value: Optional[str]) -> dict:
+        key = normalize_domain_key(str(domain_value or ""))
+        if not key or key in {"unknown", "n/a", "none", "null"}:
+            return {}
+        return domain_results.get(key, {})
+
     return (
         pl.col(domain_field)
         .cast(pl.Utf8)
         .map_elements(
-            lambda d: _domain_result_resolved_ips_csv(domain_results.get(d, {}))
-            if d and str(d).strip().lower() not in ("unknown", "n/a", "")
-            else "",
+            lambda d: _domain_result_resolved_ips_csv(_lookup_result(d)),
             return_dtype=pl.Utf8,
         )
         .alias(RESOLVED_IPS_COLUMN)
@@ -1333,9 +1509,10 @@ def _homepage_signal_value(result: Optional[dict], key: str):
 
 def _build_homepage_signal_exprs(domain_field: str, homepage_results: dict) -> list[pl.Expr]:
     def _map_domain(domain_value: Optional[str], key: str, default):
-        if not domain_value or str(domain_value).strip().lower() in ("unknown", "n/a", ""):
+        lookup_key = normalize_domain_key(str(domain_value or ""))
+        if not lookup_key or lookup_key in {"unknown", "n/a", "none", "null"}:
             return default
-        signal = _homepage_signal_value(homepage_results.get(domain_value, {}), key)
+        signal = _homepage_signal_value(homepage_results.get(lookup_key, {}), key)
         if signal is None:
             return default
         return signal
@@ -1746,6 +1923,21 @@ def _extract_normalized_keys(value: str, key_class: str) -> list[str]:
     return out
 
 
+def _collect_unique_normalized_domains(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        raw = str(value or "").strip()
+        if not raw or raw.lower() in {"unknown", "n/a", "none", "null"}:
+            continue
+        key = normalize_domain_key(raw)
+        if not key or key in {"unknown", "n/a", "none", "null"} or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 def guess_key_column(columns: list[str], preferred_class: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
     """
     Guess best key column and key class.
@@ -1984,6 +2176,7 @@ async def run_qualification_pipeline(
     include_rows: bool = True,
     include_leads: bool = True,
     include_dataframe: bool = False,
+    skip_network_checks: bool = False,
 ) -> dict:
     """
     Execute filters, domain verification, and dedupe with status tracking.
@@ -2012,8 +2205,15 @@ async def run_qualification_pipeline(
     removed_domain_ids = set()
     removed_domain_reason_by_id: dict[int, str] = {}
     tld_filter_enabled = bool(exclude_country_tlds or disallowed_tlds)
+    should_run_dns = bool(domain_check and not skip_network_checks)
+    should_run_homepage = bool(homepage_check and not skip_network_checks)
 
-    if (domain_check or homepage_check or tld_filter_enabled) and domain_field and domain_field in working.columns:
+    if skip_network_checks and (domain_check or homepage_check):
+        warnings.append(
+            "Domain/homepage network checks skipped for preview speed. Run qualification for exact website validation."
+        )
+
+    if (should_run_dns or should_run_homepage or tld_filter_enabled) and domain_field and domain_field in working.columns:
         if tld_filter_enabled:
             pre_tld = working
             (
@@ -2036,9 +2236,9 @@ async def run_qualification_pipeline(
                 removed_domain_ids.update(tld_reason_by_row_id.keys())
                 removed_domain_reason_by_id.update(tld_reason_by_row_id)
 
-        if domain_check:
+        if should_run_dns:
             domains = working[domain_field].cast(pl.Utf8).to_list()
-            unique_domains = list(set(d for d in domains if d and d.lower() not in ("unknown", "n/a", "")))
+            unique_domains = _collect_unique_normalized_domains(domains)
             if tld_filter_enabled:
                 domain_checked_count = max(domain_checked_count, len(unique_domains))
             else:
@@ -2049,13 +2249,18 @@ async def run_qualification_pipeline(
             resolved_ips_expr = _build_resolved_ips_expr(domain_field, domain_results)
             pre_domain = working.with_columns(resolved_ips_expr)
             df_with_id = df_with_id.with_columns(resolved_ips_expr)
+
+            def _allows_domain(value: Optional[str]) -> bool:
+                lookup_key = normalize_domain_key(str(value or ""))
+                if not lookup_key:
+                    return False
+                return _domain_result_allows_row(domain_results.get(lookup_key, {}))
+
             alive_mask = (
                 pre_domain[domain_field]
                 .cast(pl.Utf8)
                 .map_elements(
-                    lambda d: _domain_result_allows_row(domain_results.get(d, {}))
-                    if d and d.lower() not in ("unknown", "n/a", "")
-                    else False,
+                    lambda d: _allows_domain(d),
                     return_dtype=pl.Boolean,
                 )
             )
@@ -2076,14 +2281,12 @@ async def run_qualification_pipeline(
                 # Row-id -> reason detail mapping for inspector UX
                 removed_rows = pre_domain.filter(~alive_mask).select(["__row_id", domain_field]).to_dicts()
                 for item in removed_rows:
-                    status = domain_results.get(item.get(domain_field), {}).get("status", "unreachable")
+                    lookup_key = normalize_domain_key(str(item.get(domain_field) or ""))
+                    status = domain_results.get(lookup_key, {}).get("status", "unreachable")
                     removed_domain_reason_by_id[int(item["__row_id"])] = status
 
-        if homepage_check:
-            homepage_domains = list(set(
-                d for d in working[domain_field].cast(pl.Utf8).to_list()
-                if d and d.lower() not in ("unknown", "n/a", "")
-            ))
+        if should_run_homepage:
+            homepage_domains = _collect_unique_normalized_domains(working[domain_field].cast(pl.Utf8).to_list())
             homepage_checked_count = len(homepage_domains)
             if homepage_domains:
                 homepage_results = await collect_homepage_signals_batch(
@@ -2094,13 +2297,18 @@ async def run_qualification_pipeline(
             homepage_exprs = _build_homepage_signal_exprs(domain_field, homepage_results)
             pre_homepage = working.with_columns(homepage_exprs)
             df_with_id = df_with_id.with_columns(homepage_exprs)
+
+            def _allows_homepage(value: Optional[str]) -> bool:
+                lookup_key = normalize_domain_key(str(value or ""))
+                if not lookup_key:
+                    return False
+                return _homepage_result_allows_row(homepage_results.get(lookup_key, {}))
+
             homepage_mask = (
                 pre_homepage[domain_field]
                 .cast(pl.Utf8)
                 .map_elements(
-                    lambda d: _homepage_result_allows_row(homepage_results.get(d, {}))
-                    if d and d.lower() not in ("unknown", "n/a", "")
-                    else False,
+                    lambda d: _allows_homepage(d),
                     return_dtype=pl.Boolean,
                 )
             )
@@ -2113,7 +2321,8 @@ async def run_qualification_pipeline(
 
                 removed_rows = pre_homepage.filter(~homepage_mask).select(["__row_id", domain_field]).to_dicts()
                 for item in removed_rows:
-                    status = homepage_results.get(item.get(domain_field), {}).get("homepage_status", "homepage_disqualified")
+                    lookup_key = normalize_domain_key(str(item.get(domain_field) or ""))
+                    status = homepage_results.get(lookup_key, {}).get("homepage_status", "homepage_disqualified")
                     removed_domain_reason_by_id[int(item["__row_id"])] = status
 
             dead_domains.extend([
@@ -2194,6 +2403,184 @@ async def run_qualification_pipeline(
     }
 
 
+def _as_int_set(value: Any) -> set[int]:
+    if isinstance(value, set):
+        raw_values = value
+    elif isinstance(value, list):
+        raw_values = value
+    else:
+        return set()
+    out: set[int] = set()
+    for item in raw_values:
+        try:
+            parsed = int(item)
+        except Exception:
+            continue
+        if parsed >= 0:
+            out.add(parsed)
+    return out
+
+
+async def _finalize_paused_run(
+    session_id: str,
+    session: dict,
+    run: dict,
+    auto_disqualify_unprocessed: bool = True,
+) -> dict:
+    """
+    Finalize a paused run using currently known status sets.
+    If requested, rows not yet classified are auto-disqualified as `paused_unprocessed`.
+    """
+    start_time = time.perf_counter()
+    df = _get_session_df(session)
+    dedupe_df = _get_session_dedupe_df(session)
+    df_with_id = df.with_row_count("__row_id")
+    total_rows = int(df.height)
+    all_ids = set(df_with_id["__row_id"].to_list())
+
+    qualified_ids = _as_int_set(run.get("qualifiedIds"))
+    removed_filter_ids = _as_int_set(run.get("removedFilterIds"))
+    removed_domain_ids = _as_int_set(run.get("removedDomainIds"))
+    removed_hubspot_ids = _as_int_set(run.get("removedHubspotIds"))
+    removed_filter_reason_by_id = {
+        int(k): str(v)
+        for k, v in dict(run.get("removedFilterReasonById") or {}).items()
+        if str(k).isdigit()
+    }
+    removed_domain_reason_by_id = {
+        int(k): str(v)
+        for k, v in dict(run.get("removedDomainReasonById") or {}).items()
+        if str(k).isdigit()
+    }
+    warnings = list(run.get("warnings") or [])
+
+    if auto_disqualify_unprocessed:
+        unresolved_ids = all_ids - qualified_ids - removed_filter_ids - removed_domain_ids - removed_hubspot_ids
+        for row_id in unresolved_ids:
+            removed_filter_ids.add(row_id)
+            removed_filter_reason_by_id.setdefault(row_id, "paused_unprocessed")
+        warnings.append("Qualification was finished from paused state. Unprocessed rows were auto-disqualified.")
+    else:
+        unresolved_ids = set()
+
+    if qualified_ids:
+        working = df_with_id.filter(pl.col("__row_id").is_in(sorted(qualified_ids)))
+    else:
+        working = df_with_id.head(0)
+
+    deduped, dedupe_info = apply_hubspot_dedupe(working, dedupe_raw=session.get("dedupeRaw"), dedupe_df=dedupe_df)
+    warnings.extend(dedupe_info.get("warnings", []))
+
+    pre_dedupe_ids = set(working["__row_id"].to_list())
+    qualified_ids = set(deduped["__row_id"].to_list())
+    removed_hubspot_ids.update(pre_dedupe_ids - qualified_ids)
+
+    rows = []
+    for row in df_with_id.to_dicts():
+        row_id = int(row.pop("__row_id"))
+        if row_id in qualified_ids:
+            row_status = "qualified"
+            row_reasons = ["qualified_passed_all_checks"]
+        elif row_id in removed_filter_ids:
+            row_status = "removed_filter"
+            row_reasons = [str(removed_filter_reason_by_id.get(row_id, "rule_filter_mismatch"))]
+        elif row_id in removed_domain_ids:
+            row_status = "removed_domain"
+            domain_detail = removed_domain_reason_by_id.get(row_id, "unreachable")
+            row_reasons = [f"domain_{domain_detail}".replace("/", "_").replace(" ", "_").replace(":", "_")]
+        elif row_id in removed_hubspot_ids:
+            row_status = "removed_hubspot"
+            row_reasons = ["hubspot_duplicate_match"]
+        elif row_id in unresolved_ids:
+            row_status = "removed_filter"
+            row_reasons = ["paused_unprocessed"]
+        else:
+            row_status = "removed_filter"
+            row_reasons = [str(removed_filter_reason_by_id.get(row_id, "rule_filter_mismatch"))]
+
+        rows.append({
+            **row,
+            "_rowId": row_id,
+            "_rowStatus": row_status,
+            "_rowReasons": row_reasons,
+        })
+
+    qualified_for_return = deduped.drop("__row_id")
+    removed_breakdown = {
+        "removedFilter": len(removed_filter_ids),
+        "removedDomain": len(removed_domain_ids),
+        "removedHubspot": len(removed_hubspot_ids),
+    }
+    output_columns = [col for col in df_with_id.columns if col != "__row_id"]
+    processing_ms = int((time.perf_counter() - start_time) * 1000)
+
+    run_config = dict(run.get("runConfig") or {})
+    domain_results = dict(run.get("domainResults") or {})
+    domain_results.setdefault("checked", 0)
+    domain_results.setdefault("homepageChecked", 0)
+    domain_results.setdefault("dead", [])
+    domain_results.setdefault("cdnReference", get_cdn_reference_data())
+
+    status_sets = {
+        "qualifiedIds": qualified_ids,
+        "removedFilterIds": removed_filter_ids,
+        "removedFilterReasonById": removed_filter_reason_by_id,
+        "removedDomainIds": removed_domain_ids,
+        "removedHubspotIds": removed_hubspot_ids,
+        "removedDomainReasonById": removed_domain_reason_by_id,
+    }
+
+    result = {
+        "sessionId": session_id,
+        "totalRows": total_rows,
+        "qualifiedCount": int(qualified_for_return.height),
+        "removedCount": int(total_rows - qualified_for_return.height),
+        "removedBreakdown": removed_breakdown,
+        "rows": rows,
+        "leads": qualified_for_return.to_dicts(),
+        "columns": output_columns,
+        "domainResults": domain_results,
+        "meta": {
+            "processingMs": processing_ms,
+            "domainCheckEnabled": bool(run_config.get("domainCheck")),
+            "homepageCheckEnabled": bool(run_config.get("homepageCheck")),
+            "websiteKeywords": list(run_config.get("websiteKeywords") or []),
+            "tldFilter": {
+                "excludeCountryTlds": bool(run_config.get("excludeCountryTlds")),
+                "disallowList": sorted(set(run_config.get("disallowedTlds") or [])),
+                "allowList": sorted(set(run_config.get("allowedTlds") or [])),
+            },
+            "dedupe": dedupe_info,
+            "warnings": warnings,
+        },
+    }
+
+    run.update({
+        "status": "done",
+        "stage": "complete",
+        "progress": 1.0,
+        "message": "Qualification complete.",
+        "pauseRequested": False,
+        "finishOnPause": False,
+        "processedRows": total_rows,
+        "totalRows": total_rows,
+        "qualifiedCount": result["qualifiedCount"],
+        "removedCount": result["removedCount"],
+        "removedBreakdown": removed_breakdown,
+        "warnings": warnings,
+        "domainResults": domain_results,
+        "error": "",
+        "finishedAt": time.time(),
+        "result": result,
+        **status_sets,
+    })
+    session["lastRunResult"] = result
+    session["lastRunStatus"] = status_sets
+    session["updatedAt"] = time.time()
+    _persist_session(session_id, session)
+    return result
+
+
 async def _run_session_qualification_job(
     session_id: str,
     run_id: str,
@@ -2217,12 +2604,82 @@ async def _run_session_qualification_job(
             return session, None
         return session, run
 
-    def _update_run(**kwargs) -> bool:
+    def _update_run(persist: bool = False, **kwargs) -> bool:
         session, run = _get_current_run()
         if not session or not run:
             return False
         run.update(kwargs)
         session["updatedAt"] = time.time()
+        if persist:
+            _persist_session(session_id, session)
+        return True
+
+    def _pause_requested() -> bool:
+        _, run = _get_current_run()
+        return bool(isinstance(run, dict) and run.get("pauseRequested"))
+
+    async def _handle_pause(
+        *,
+        total_rows: int,
+        current_qualified_ids: set[int],
+        removed_filter_count: int,
+        removed_filter_ids: set[int],
+        removed_filter_reason_by_id: dict[int, str],
+        removed_domain_ids: set[int],
+        removed_domain_reason_by_id: dict[int, str],
+        removed_hubspot_ids: set[int],
+        domain_checked_count: int,
+        homepage_checked_count: int,
+        dead_domains: list[dict],
+        warnings: list[str],
+    ) -> bool:
+        if not _pause_requested():
+            return False
+
+        session, run = _get_current_run()
+        if not session or not run:
+            return True
+
+        removed_breakdown = {
+            "removedFilter": removed_filter_count,
+            "removedDomain": len(removed_domain_ids),
+            "removedHubspot": len(removed_hubspot_ids),
+        }
+        run.update({
+            "status": "paused",
+            "stage": "paused",
+            "progress": float(run.get("progress", 0.0)),
+            "message": "Qualification paused. Resume to continue, or finish to auto-disqualify remaining rows.",
+            "pauseRequested": False,
+            "pausedAt": time.time(),
+            "qualifiedIds": set(current_qualified_ids),
+            "removedFilterIds": set(removed_filter_ids),
+            "removedFilterReasonById": dict(removed_filter_reason_by_id),
+            "removedDomainIds": set(removed_domain_ids),
+            "removedHubspotIds": set(removed_hubspot_ids),
+            "removedDomainReasonById": dict(removed_domain_reason_by_id),
+            "qualifiedCount": len(current_qualified_ids),
+            "removedCount": removed_filter_count + len(removed_domain_ids),
+            "removedBreakdown": removed_breakdown,
+            "domainResults": {
+                "checked": int(domain_checked_count),
+                "homepageChecked": int(homepage_checked_count),
+                "dead": list(dead_domains),
+                "cdnReference": get_cdn_reference_data(),
+            },
+            "warnings": list(warnings),
+        })
+        session["updatedAt"] = time.time()
+        _persist_session(session_id, session)
+
+        if bool(run.get("finishOnPause")):
+            run["finishOnPause"] = False
+            await _finalize_paused_run(
+                session_id=session_id,
+                session=session,
+                run=run,
+                auto_disqualify_unprocessed=True,
+            )
         return True
 
     try:
@@ -2273,7 +2730,24 @@ async def _run_session_qualification_job(
         removed_domain_count = 0
         removed_domain_ids: set[int] = set()
         removed_domain_reason_by_id: dict[int, str] = {}
+        removed_hubspot_ids: set[int] = set()
         tld_filter_enabled = bool(exclude_country_tlds or disallowed_tlds)
+
+        if await _handle_pause(
+            total_rows=total_rows,
+            current_qualified_ids=set(after_filter_ids),
+            removed_filter_count=removed_filter_count,
+            removed_filter_ids=removed_filter_ids,
+            removed_filter_reason_by_id=removed_filter_reason_by_id,
+            removed_domain_ids=removed_domain_ids,
+            removed_domain_reason_by_id=removed_domain_reason_by_id,
+            removed_hubspot_ids=removed_hubspot_ids,
+            domain_checked_count=domain_checked_count,
+            homepage_checked_count=homepage_checked_count,
+            dead_domains=dead_domains,
+            warnings=warnings,
+        ):
+            return
 
         if (domain_check or homepage_check or tld_filter_enabled) and domain_field and domain_field in working.columns:
             if tld_filter_enabled:
@@ -2302,12 +2776,41 @@ async def _run_session_qualification_job(
                 if tld_removed_count > 0:
                     removed_domain_ids.update(tld_reason_by_row_id.keys())
                     removed_domain_reason_by_id.update(tld_reason_by_row_id)
+                removed_domain_count = len(removed_domain_ids)
+                _update_run(
+                    stage="domain",
+                    message="TLD filters applied.",
+                    qualifiedIds=set(working["__row_id"].to_list()),
+                    removedDomainIds=set(removed_domain_ids),
+                    removedDomainReasonById=dict(removed_domain_reason_by_id),
+                    removedBreakdown={
+                        "removedFilter": removed_filter_count,
+                        "removedDomain": removed_domain_count,
+                        "removedHubspot": 0,
+                    },
+                    qualifiedCount=working.height,
+                    removedCount=removed_filter_count + removed_domain_count,
+                    processedRows=removed_filter_count + removed_domain_count,
+                )
+
+                if await _handle_pause(
+                    total_rows=total_rows,
+                    current_qualified_ids=set(working["__row_id"].to_list()),
+                    removed_filter_count=removed_filter_count,
+                    removed_filter_ids=removed_filter_ids,
+                    removed_filter_reason_by_id=removed_filter_reason_by_id,
+                    removed_domain_ids=removed_domain_ids,
+                    removed_domain_reason_by_id=removed_domain_reason_by_id,
+                    removed_hubspot_ids=removed_hubspot_ids,
+                    domain_checked_count=domain_checked_count,
+                    homepage_checked_count=homepage_checked_count,
+                    dead_domains=dead_domains,
+                    warnings=warnings,
+                ):
+                    return
 
             if domain_check:
-                unique_domains = list(set(
-                    d for d in working[domain_field].cast(pl.Utf8).to_list()
-                    if d and d.lower() not in ("unknown", "n/a", "")
-                ))
+                unique_domains = _collect_unique_normalized_domains(working[domain_field].cast(pl.Utf8).to_list())
                 if tld_filter_enabled:
                     domain_checked_count = max(domain_checked_count, len(unique_domains))
                 else:
@@ -2319,6 +2822,46 @@ async def _run_session_qualification_job(
                     message=f"Validating domains (0/{len(unique_domains)})...",
                 )
 
+                domain_rows_by_key: dict[str, set[int]] = {}
+                for item in working.select(["__row_id", domain_field]).to_dicts():
+                    key = normalize_domain_key(str(item.get(domain_field) or ""))
+                    if not key:
+                        continue
+                    domain_rows_by_key.setdefault(key, set()).add(int(item["__row_id"]))
+
+                domain_live_removed = set(removed_domain_ids)
+                domain_live_reason = dict(removed_domain_reason_by_id)
+                domain_candidates = set(working["__row_id"].to_list())
+                domain_processed_rows: set[int] = set()
+                domain_seen_dead: set[str] = set()
+                domain_processed = 0
+                domain_emit_state = {"ts": 0.0, "processed": 0}
+
+                def _emit_domain_live(force: bool = False):
+                    now = time.time()
+                    if (
+                        not force
+                        and (domain_processed - int(domain_emit_state["processed"]) < 200)
+                        and (now - float(domain_emit_state["ts"]) < 0.35)
+                    ):
+                        return
+                    live_qualified = domain_processed_rows - domain_live_removed
+                    _update_run(
+                        qualifiedIds=set(live_qualified),
+                        removedDomainIds=set(domain_live_removed),
+                        removedDomainReasonById=dict(domain_live_reason),
+                        removedBreakdown={
+                            "removedFilter": removed_filter_count,
+                            "removedDomain": len(domain_live_removed),
+                            "removedHubspot": 0,
+                        },
+                        qualifiedCount=len(live_qualified),
+                        removedCount=removed_filter_count + len(domain_live_removed),
+                        processedRows=removed_filter_count + len(domain_live_removed),
+                    )
+                    domain_emit_state["ts"] = now
+                    domain_emit_state["processed"] = domain_processed
+
                 def _on_domain_progress(processed: int, total: int) -> None:
                     total_safe = max(total, 1)
                     stage_progress = min(processed / total_safe, 1.0)
@@ -2328,48 +2871,86 @@ async def _run_session_qualification_job(
                         message=f"Validating domains ({processed}/{total})...",
                     )
 
+                def _on_domain_result(domain: str, result: dict) -> None:
+                    nonlocal domain_processed
+                    key = normalize_domain_key(str(domain or ""))
+                    row_ids = domain_rows_by_key.get(key, set())
+                    if row_ids:
+                        domain_processed_rows.update({int(v) for v in row_ids})
+                    if row_ids and not _domain_result_allows_row(result):
+                        status = str(result.get("status") or "unreachable")
+                        for row_id in row_ids:
+                            domain_live_removed.add(int(row_id))
+                            domain_live_reason[int(row_id)] = status
+                        if key and key not in domain_seen_dead:
+                            domain_seen_dead.add(key)
+                            dead_domains.append({"domain": key, "status": status})
+                    domain_processed += 1
+                    _emit_domain_live(force=False)
+
                 domain_results = await check_domains_dns_batch(
                     unique_domains,
                     concurrency=800,
                     progress_callback=_on_domain_progress,
+                    should_stop=_pause_requested,
+                    result_callback=_on_domain_result,
                 )
+                _emit_domain_live(force=True)
+
+                removed_domain_ids = set(domain_live_removed)
+                removed_domain_reason_by_id = dict(domain_live_reason)
+                removed_domain_count = len(removed_domain_ids)
+
+                if await _handle_pause(
+                    total_rows=total_rows,
+                    current_qualified_ids=(domain_processed_rows - removed_domain_ids),
+                    removed_filter_count=removed_filter_count,
+                    removed_filter_ids=removed_filter_ids,
+                    removed_filter_reason_by_id=removed_filter_reason_by_id,
+                    removed_domain_ids=removed_domain_ids,
+                    removed_domain_reason_by_id=removed_domain_reason_by_id,
+                    removed_hubspot_ids=removed_hubspot_ids,
+                    domain_checked_count=domain_checked_count,
+                    homepage_checked_count=homepage_checked_count,
+                    dead_domains=dead_domains,
+                    warnings=warnings,
+                ):
+                    return
 
                 resolved_ips_expr = _build_resolved_ips_expr(domain_field, domain_results)
                 pre_domain = working.with_columns(resolved_ips_expr)
                 df_with_id = df_with_id.with_columns(resolved_ips_expr)
+
+                def _allows_domain(value: Optional[str]) -> bool:
+                    lookup_key = normalize_domain_key(str(value or ""))
+                    if not lookup_key:
+                        return False
+                    return _domain_result_allows_row(domain_results.get(lookup_key, {}))
+
                 alive_mask = (
                     pre_domain[domain_field]
                     .cast(pl.Utf8)
                     .map_elements(
-                        lambda d: _domain_result_allows_row(domain_results.get(d, {}))
-                        if d and d.lower() not in ("unknown", "n/a", "")
-                        else False,
+                        lambda d: _allows_domain(d),
                         return_dtype=pl.Boolean,
                     )
                 )
                 working = pre_domain.filter(alive_mask)
-                removed_domain_count += pre_domain.height - working.height
+                removed_domain_count = len(removed_domain_ids)
 
                 post_domain_ids = set(working["__row_id"].to_list())
                 dns_removed_ids = set(pre_domain["__row_id"].to_list()) - post_domain_ids
                 removed_domain_ids.update(dns_removed_ids)
-
-                dead_domains.extend([
-                    {"domain": d, "status": domain_results.get(d, {}).get("status", "unknown")}
-                    for d in unique_domains
-                    if not _domain_result_allows_row(domain_results.get(d, {}))
-                ])
+                removed_domain_count = len(removed_domain_ids)
 
                 removed_rows = pre_domain.filter(~alive_mask).select(["__row_id", domain_field]).to_dicts()
                 for item in removed_rows:
-                    status = domain_results.get(item.get(domain_field), {}).get("status", "unreachable")
+                    lookup_key = normalize_domain_key(str(item.get(domain_field) or ""))
+                    status = domain_results.get(lookup_key, {}).get("status", "unreachable")
                     removed_domain_reason_by_id[int(item["__row_id"])] = status
 
             if homepage_check:
-                homepage_domains = list(set(
-                    d for d in working[domain_field].cast(pl.Utf8).to_list()
-                    if d and d.lower() not in ("unknown", "n/a", "")
-                ))
+                homepage_domains = _collect_unique_normalized_domains(working[domain_field].cast(pl.Utf8).to_list())
                 homepage_checked_count = len(homepage_domains)
 
                 _update_run(
@@ -2387,44 +2968,125 @@ async def _run_session_qualification_job(
                         message=f"Scraping homepages ({processed}/{total})...",
                     )
 
+                homepage_rows_by_key: dict[str, set[int]] = {}
+                for item in working.select(["__row_id", domain_field]).to_dicts():
+                    key = normalize_domain_key(str(item.get(domain_field) or ""))
+                    if not key:
+                        continue
+                    homepage_rows_by_key.setdefault(key, set()).add(int(item["__row_id"]))
+
+                homepage_live_removed = set(removed_domain_ids)
+                homepage_live_reason = dict(removed_domain_reason_by_id)
+                homepage_candidates = set(working["__row_id"].to_list())
+                homepage_processed_rows: set[int] = set()
+                homepage_seen_dead: set[str] = set()
+                homepage_processed = 0
+                homepage_emit_state = {"ts": 0.0, "processed": 0}
+
+                def _emit_homepage_live(force: bool = False):
+                    now = time.time()
+                    if (
+                        not force
+                        and (homepage_processed - int(homepage_emit_state["processed"]) < 80)
+                        and (now - float(homepage_emit_state["ts"]) < 0.35)
+                    ):
+                        return
+                    live_qualified = homepage_processed_rows - homepage_live_removed
+                    _update_run(
+                        qualifiedIds=set(live_qualified),
+                        removedDomainIds=set(homepage_live_removed),
+                        removedDomainReasonById=dict(homepage_live_reason),
+                        removedBreakdown={
+                            "removedFilter": removed_filter_count,
+                            "removedDomain": len(homepage_live_removed),
+                            "removedHubspot": 0,
+                        },
+                        qualifiedCount=len(live_qualified),
+                        removedCount=removed_filter_count + len(homepage_live_removed),
+                        processedRows=removed_filter_count + len(homepage_live_removed),
+                    )
+                    homepage_emit_state["ts"] = now
+                    homepage_emit_state["processed"] = homepage_processed
+
+                def _on_homepage_result(domain: str, result: dict) -> None:
+                    nonlocal homepage_processed
+                    key = normalize_domain_key(str(domain or ""))
+                    row_ids = homepage_rows_by_key.get(key, set())
+                    if row_ids:
+                        homepage_processed_rows.update({int(v) for v in row_ids})
+                    if row_ids and not _homepage_result_allows_row(result):
+                        status = str(result.get("homepage_status") or "homepage_disqualified")
+                        for row_id in row_ids:
+                            homepage_live_removed.add(int(row_id))
+                            homepage_live_reason[int(row_id)] = status
+                        if key and key not in homepage_seen_dead:
+                            homepage_seen_dead.add(key)
+                            dead_domains.append({"domain": key, "status": status})
+                    homepage_processed += 1
+                    _emit_homepage_live(force=False)
+
                 if homepage_domains:
                     homepage_results = await collect_homepage_signals_batch(
                         homepage_domains,
                         website_keywords=website_keywords,
                         concurrency=80,
                         progress_callback=_on_homepage_progress,
+                        should_stop=_pause_requested,
+                        result_callback=_on_homepage_result,
                     )
+                _emit_homepage_live(force=True)
+
+                removed_domain_ids = set(homepage_live_removed)
+                removed_domain_reason_by_id = dict(homepage_live_reason)
+                removed_domain_count = len(removed_domain_ids)
+
+                if await _handle_pause(
+                    total_rows=total_rows,
+                    current_qualified_ids=(homepage_processed_rows - removed_domain_ids),
+                    removed_filter_count=removed_filter_count,
+                    removed_filter_ids=removed_filter_ids,
+                    removed_filter_reason_by_id=removed_filter_reason_by_id,
+                    removed_domain_ids=removed_domain_ids,
+                    removed_domain_reason_by_id=removed_domain_reason_by_id,
+                    removed_hubspot_ids=removed_hubspot_ids,
+                    domain_checked_count=domain_checked_count,
+                    homepage_checked_count=homepage_checked_count,
+                    dead_domains=dead_domains,
+                    warnings=warnings,
+                ):
+                    return
 
                 homepage_exprs = _build_homepage_signal_exprs(domain_field, homepage_results)
                 pre_homepage = working.with_columns(homepage_exprs)
                 df_with_id = df_with_id.with_columns(homepage_exprs)
+
+                def _allows_homepage(value: Optional[str]) -> bool:
+                    lookup_key = normalize_domain_key(str(value or ""))
+                    if not lookup_key:
+                        return False
+                    return _homepage_result_allows_row(homepage_results.get(lookup_key, {}))
+
                 homepage_mask = (
                     pre_homepage[domain_field]
                     .cast(pl.Utf8)
                     .map_elements(
-                        lambda d: _homepage_result_allows_row(homepage_results.get(d, {}))
-                        if d and d.lower() not in ("unknown", "n/a", "")
-                        else False,
+                        lambda d: _allows_homepage(d),
                         return_dtype=pl.Boolean,
                     )
                 )
                 working = pre_homepage.filter(homepage_mask)
-                removed_domain_count += pre_homepage.height - working.height
+                removed_domain_count = len(removed_domain_ids)
 
                 post_homepage_ids = set(working["__row_id"].to_list())
                 homepage_removed_ids = set(pre_homepage["__row_id"].to_list()) - post_homepage_ids
                 removed_domain_ids.update(homepage_removed_ids)
+                removed_domain_count = len(removed_domain_ids)
 
                 removed_rows = pre_homepage.filter(~homepage_mask).select(["__row_id", domain_field]).to_dicts()
                 for item in removed_rows:
-                    status = homepage_results.get(item.get(domain_field), {}).get("homepage_status", "homepage_disqualified")
+                    lookup_key = normalize_domain_key(str(item.get(domain_field) or ""))
+                    status = homepage_results.get(lookup_key, {}).get("homepage_status", "homepage_disqualified")
                     removed_domain_reason_by_id[int(item["__row_id"])] = status
-
-                dead_domains.extend([
-                    {"domain": d, "status": homepage_results.get(d, {}).get("homepage_status", "homepage_disqualified")}
-                    for d in homepage_domains
-                    if not _homepage_result_allows_row(homepage_results.get(d, {}))
-                ])
         elif domain_check or homepage_check or tld_filter_enabled:
             warnings.append(
                 "Domain verification, homepage checks, or TLD filtering was enabled, but the selected website column was unavailable."
@@ -2439,11 +3101,11 @@ async def _run_session_qualification_job(
             removedDomainReasonById=removed_domain_reason_by_id,
             removedBreakdown={
                 "removedFilter": removed_filter_count,
-                "removedDomain": removed_domain_count,
+                "removedDomain": len(removed_domain_ids),
                 "removedHubspot": 0,
             },
             qualifiedCount=working.height,
-            removedCount=removed_filter_count + removed_domain_count,
+            removedCount=removed_filter_count + len(removed_domain_ids),
         )
 
         _update_run(
@@ -2468,7 +3130,7 @@ async def _run_session_qualification_job(
             removedHubspotIds=removed_hubspot_ids,
             removedBreakdown={
                 "removedFilter": removed_filter_count,
-                "removedDomain": removed_domain_count,
+                "removedDomain": len(removed_domain_ids),
                 "removedHubspot": removed_hubspot_count,
             },
             qualifiedCount=len(qualified_ids),
@@ -2506,7 +3168,7 @@ async def _run_session_qualification_job(
         output_columns = [col for col in df_with_id.columns if col != "__row_id"]
         removed_breakdown = {
             "removedFilter": removed_filter_count,
-            "removedDomain": removed_domain_count,
+            "removedDomain": len(removed_domain_ids),
             "removedHubspot": removed_hubspot_count,
         }
         processing_ms = int((time.perf_counter() - start_time) * 1000)
@@ -2556,6 +3218,9 @@ async def _run_session_qualification_job(
                 "stage": "complete",
                 "progress": 1.0,
                 "message": "Qualification complete.",
+                "pauseRequested": False,
+                "finishOnPause": False,
+                "pausedAt": None,
                 "processedRows": total_rows,
                 "totalRows": total_rows,
                 "qualifiedCount": result["qualifiedCount"],
@@ -2581,11 +3246,271 @@ async def _run_session_qualification_job(
                 "stage": "error",
                 "progress": 1.0,
                 "message": "Qualification failed.",
+                "pauseRequested": False,
+                "finishOnPause": False,
                 "error": f"{type(exc).__name__}: {exc}",
                 "finishedAt": time.time(),
             })
             session["updatedAt"] = time.time()
             _persist_session(session_id, session)
+        traceback.print_exc()
+
+
+def _resolve_scrape_domain_field(df: pl.DataFrame, preferred: str = "") -> str:
+    candidate = str(preferred or "").strip()
+    if candidate and candidate in df.columns:
+        return candidate
+    guessed, key_class = guess_key_column(df.columns, preferred_class="domain")
+    if key_class == "domain" and guessed and guessed in df.columns:
+        return guessed
+    return ""
+
+
+async def _run_session_scrape_job(
+    session_id: str,
+    scrape_id: str,
+    domain_field: str,
+) -> None:
+    def _get_current_scrape() -> tuple[Optional[dict], Optional[dict]]:
+        session = SESSION_STORE.get(session_id)
+        if not session:
+            return None, None
+        scrape = session.get("activeScrape")
+        if not isinstance(scrape, dict) or scrape.get("scrapeId") != scrape_id:
+            return session, None
+        return session, scrape
+
+    def _update_scrape(persist: bool = False, **kwargs) -> bool:
+        session, scrape = _get_current_scrape()
+        if not session or not scrape:
+            return False
+        scrape.update(kwargs)
+        session["updatedAt"] = time.time()
+        if persist:
+            _persist_session(session_id, session)
+        return True
+
+    try:
+        session = _touch_session(session_id)
+        df = _get_session_df(session)
+        resolved_domain_field = _resolve_scrape_domain_field(df, domain_field)
+        if not resolved_domain_field:
+            raise ValueError("Unable to infer a domain column for scraping. Select a website/domain field first.")
+
+        domain_rows_by_key: dict[str, set[int]] = {}
+        domain_values = df[resolved_domain_field].cast(pl.Utf8, strict=False).fill_null("").to_list()
+        for row_id, raw_value in enumerate(domain_values):
+            key = normalize_domain_key(str(raw_value or ""))
+            if not key:
+                continue
+            domain_rows_by_key.setdefault(key, set()).add(int(row_id))
+
+        targets = [
+            ScrapeTarget(domain=domain_key, url=f"https://{domain_key}")
+            for domain_key in domain_rows_by_key.keys()
+        ]
+        total_targets = len(targets)
+        if total_targets == 0:
+            raise ValueError("No valid domains found in the selected domain field.")
+
+        output_dir = SCRAPE_JOB_DIR / session_id / scrape_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        paths = build_scrape_paths(output_dir)
+        warnings: list[str] = []
+
+        _update_scrape(
+            stage="phase1",
+            progress=0.04,
+            message=f"Phase 1 async scrape starting (0/{total_targets})...",
+            processed=0,
+            total=total_targets,
+            ok=0,
+            fail=0,
+            domainField=resolved_domain_field,
+            outputDir=str(output_dir),
+            persist=True,
+        )
+
+        def _on_phase1_progress(payload: dict) -> None:
+            processed = int(payload.get("processed", 0))
+            total = int(payload.get("total", total_targets))
+            stage_progress = min(processed / max(total, 1), 1.0)
+            _update_scrape(
+                stage="phase1",
+                progress=0.04 + (0.60 * stage_progress),
+                message=f"Phase 1 async scrape ({processed}/{total})...",
+                processed=processed,
+                total=total,
+                ok=int(payload.get("ok", 0)),
+                fail=int(payload.get("fail", 0)),
+                ratePerSec=float(payload.get("ratePerSec", 0.0)),
+            )
+
+        await run_scrape_phase1_async(
+            targets=targets,
+            out_path=paths["phase1"],
+            failures_path=paths["phase1_failures"],
+            state_path=paths["state"],
+            concurrency=SCRAPE_PHASE1_CONCURRENCY,
+            timeout_seconds=SCRAPE_PHASE1_TIMEOUT,
+            retry_count=SCRAPE_PHASE1_RETRY,
+            resume=False,
+            progress_callback=_on_phase1_progress,
+        )
+
+        _update_scrape(
+            stage="phase2",
+            progress=0.66,
+            message="Phase 2 headless fallback starting...",
+            persist=True,
+        )
+
+        def _on_phase2_progress(payload: dict) -> None:
+            processed = int(payload.get("processed", 0))
+            total = int(payload.get("total", 0))
+            stage_progress = min(processed / max(total, 1), 1.0) if total > 0 else 1.0
+            _update_scrape(
+                stage="phase2",
+                progress=0.66 + (0.22 * stage_progress),
+                message=f"Phase 2 fallback ({processed}/{total})...",
+                processed=processed,
+                total=total,
+                ok=int(payload.get("ok", 0)),
+                fail=int(payload.get("fail", 0)),
+                ratePerSec=float(payload.get("ratePerSec", 0.0)),
+            )
+
+        try:
+            await run_scrape_phase2_fallback(
+                phase1_path=paths["phase1"],
+                failures_path=paths["phase1_failures"],
+                phase2_path=paths["phase2"],
+                merged_path=paths["merged"],
+                state_path=paths["state"],
+                concurrency=SCRAPE_PHASE2_CONCURRENCY,
+                timeout_seconds=SCRAPE_PHASE2_TIMEOUT,
+                progress_callback=_on_phase2_progress,
+            )
+        except Exception as exc:
+            warnings.append(f"Phase 2 fallback skipped: {type(exc).__name__}: {exc}")
+            if paths["phase1"].exists() and not paths["merged"].exists():
+                shutil.copy2(paths["phase1"], paths["merged"])
+
+        merged_source = paths["merged"] if paths["merged"].exists() else paths["phase1"]
+        if not merged_source.exists():
+            raise RuntimeError("Scraper output not found after phase execution.")
+
+        _update_scrape(
+            stage="keywords",
+            progress=0.90,
+            message="Extracting TF-IDF keywords...",
+            persist=True,
+        )
+        extract_scrape_keywords(
+            merged_path=merged_source,
+            enriched_path=paths["enriched"],
+            top_k=SCRAPE_KEYWORD_TOP_K,
+            write_csv=True,
+        )
+
+        if not paths["enriched"].exists():
+            raise RuntimeError("Enriched scraper output was not created.")
+        enriched_df = pl.read_parquet(str(paths["enriched"]))
+        if "domain" not in enriched_df.columns:
+            raise RuntimeError("Enriched scraper output is missing `domain`.")
+
+        _update_scrape(
+            stage="merging",
+            progress=0.95,
+            message="Merging scraped fields into session...",
+            persist=True,
+        )
+
+        available_source_cols = [col for col in SCRAPE_COLUMN_MAP.keys() if col in enriched_df.columns]
+        normalized_scrape = (
+            enriched_df
+            .with_columns(
+                pl.col("domain")
+                .cast(pl.Utf8, strict=False)
+                .fill_null("")
+                .map_elements(normalize_domain_key, return_dtype=pl.Utf8)
+                .alias("__scrape_key")
+            )
+            .filter(pl.col("__scrape_key").str.len_chars() > 0)
+            .select(["__scrape_key"] + available_source_cols)
+            .rename({key: SCRAPE_COLUMN_MAP[key] for key in available_source_cols})
+            .unique(subset=["__scrape_key"], keep="first")
+        )
+
+        source_with_key = (
+            df
+            .with_columns(
+                pl.col(resolved_domain_field)
+                .cast(pl.Utf8, strict=False)
+                .fill_null("")
+                .map_elements(normalize_domain_key, return_dtype=pl.Utf8)
+                .alias("__scrape_key")
+            )
+        )
+        existing_scrape_cols = [col for col in SCRAPE_ENRICH_COLUMNS if col in source_with_key.columns]
+        if existing_scrape_cols:
+            source_with_key = source_with_key.drop(existing_scrape_cols)
+        merged_df = source_with_key.join(normalized_scrape, on="__scrape_key", how="left").drop("__scrape_key")
+
+        session, scrape = _get_current_scrape()
+        if not session or not scrape:
+            return
+
+        _replace_session_dataframe(session, merged_df)
+
+        ok_count = int(
+            enriched_df
+            .filter(pl.col("status").cast(pl.Utf8, strict=False).fill_null("") == "ok")
+            .height
+        ) if "status" in enriched_df.columns else 0
+        fail_count = int(max(0, enriched_df.height - ok_count))
+        matched_rows = int(
+            merged_df
+            .filter(pl.col("scrape_status").cast(pl.Utf8, strict=False).is_not_null())
+            .height
+        ) if "scrape_status" in merged_df.columns else 0
+
+        scrape.update({
+            "status": "done",
+            "stage": "complete",
+            "progress": 1.0,
+            "message": "Homepage scraping complete.",
+            "processed": int(enriched_df.height),
+            "total": total_targets,
+            "ok": ok_count,
+            "fail": fail_count,
+            "domainField": resolved_domain_field,
+            "outputDir": str(output_dir),
+            "error": "",
+            "finishedAt": time.time(),
+            "result": {
+                "targets": total_targets,
+                "scrapedDomains": int(enriched_df.height),
+                "matchedRows": matched_rows,
+                "ok": ok_count,
+                "fail": fail_count,
+                "outputDir": str(output_dir),
+                "columnsAdded": SCRAPE_ENRICH_COLUMNS,
+                "warnings": warnings,
+            },
+        })
+        session["updatedAt"] = time.time()
+        _persist_session(session_id, session)
+    except Exception as exc:
+        _update_scrape(
+            status="error",
+            stage="error",
+            progress=1.0,
+            message="Homepage scraping failed.",
+            error=f"{type(exc).__name__}: {exc}",
+            finishedAt=time.time(),
+            persist=True,
+        )
         traceback.print_exc()
 
 
@@ -2752,8 +3677,12 @@ def _format_rule_reason(rule: dict, index: int) -> str:
 
     if match_type == "contains":
         clause = f"{field} contains"
+    elif match_type == "not_contains":
+        clause = f"{field} does not contain"
     elif match_type == "exact":
         clause = f"{field} equals"
+    elif match_type == "not_exact":
+        clause = f"{field} is not"
     elif match_type == "fuzzy":
         clause = f"{field} fuzzy match"
     elif match_type == "excludes":
@@ -2820,6 +3749,18 @@ def apply_rules(df: pl.DataFrame, rules: list[dict]) -> pl.DataFrame:
             mask = df[field].cast(pl.Utf8).str.to_lowercase().is_in(lower_vals)
             df = df.filter(mask)
 
+        elif match_type == "not_exact":
+            groups = rule.get("groups", [])
+            if groups:
+                values = [v.strip() for g in groups for v in g.get("tags", []) if v.strip()]
+            else:
+                values = [v.strip() for v in rule.get("values", []) if v.strip()]
+            if not values:
+                continue
+            lower_vals = [v.lower() for v in values]
+            mask = ~df[field].cast(pl.Utf8).str.to_lowercase().is_in(lower_vals)
+            df = df.filter(mask)
+
         elif match_type == "contains":
             groups = rule.get("groups", [])
             col_expr = df[field].cast(pl.Utf8).str.to_lowercase()
@@ -2855,6 +3796,40 @@ def apply_rules(df: pl.DataFrame, rules: list[dict]) -> pl.DataFrame:
                     for v in values:
                         combined_expr = combined_expr | col_expr.str.contains(v.lower(), literal=True)
                 df = df.filter(combined_expr)
+
+        elif match_type == "not_contains":
+            groups = rule.get("groups", [])
+            col_expr = df[field].cast(pl.Utf8).str.to_lowercase()
+
+            if groups:
+                groups_logic = rule.get("groupsLogic", "or").lower()
+                group_exprs = [_build_contains_group_expr(col_expr, g) for g in groups]
+                group_exprs = [e for e in group_exprs if e is not None]
+                if not group_exprs:
+                    continue
+                if groups_logic == "and":
+                    combined = group_exprs[0]
+                    for e in group_exprs[1:]:
+                        combined = combined & e
+                else:
+                    combined = group_exprs[0]
+                    for e in group_exprs[1:]:
+                        combined = combined | e
+                df = df.filter(~combined)
+            else:
+                values = [v.strip() for v in rule.get("values", []) if v.strip()]
+                if not values:
+                    continue
+                logic = rule.get("logic", "or").lower()
+                if logic == "and":
+                    combined_expr = pl.lit(True)
+                    for v in values:
+                        combined_expr = combined_expr & col_expr.str.contains(v.lower(), literal=True)
+                else:
+                    combined_expr = pl.lit(False)
+                    for v in values:
+                        combined_expr = combined_expr | col_expr.str.contains(v.lower(), literal=True)
+                df = df.filter(~combined_expr)
 
         elif match_type == "fuzzy":
             groups = rule.get("groups", [])
@@ -3073,6 +4048,52 @@ async def session_state(sessionId: str):
     return payload
 
 
+@app.get("/api/session/latest")
+async def session_latest():
+    """Return most recently updated persisted session payload."""
+    _clean_stale_sessions()
+    if not SESSION_STORE:
+        raise HTTPException(status_code=404, detail="No persisted sessions available.")
+    latest_id, latest_session = max(
+        SESSION_STORE.items(),
+        key=lambda item: float(item[1].get("updatedAt") or 0.0),
+    )
+    payload = _build_session_payload(latest_id, latest_session)
+    _persist_session(latest_id, latest_session)
+    return payload
+
+
+@app.post("/api/session/config")
+async def session_set_config(
+    sessionId: str = Form(...),
+    rules: str = Form("[]"),
+    domainCheck: str = Form("false"),
+    homepageCheck: str = Form("false"),
+    domainField: str = Form(""),
+    websiteKeywords: str = Form("[]"),
+    excludeCountryTlds: str = Form("false"),
+    tldDisallowList: str = Form("[]"),
+    tldAllowList: str = Form("[]"),
+):
+    """Persist workspace config so sessions restore with previous settings."""
+    session = _touch_session(sessionId)
+    parsed_rules = _parse_rules_payload(rules)
+    config_payload = {
+        "rules": parsed_rules,
+        "domainCheck": _parse_form_bool(domainCheck),
+        "homepageCheck": _parse_form_bool(homepageCheck),
+        "domainField": str(domainField or "").strip(),
+        "websiteKeywords": _parse_website_keywords_payload(websiteKeywords),
+        "excludeCountryTlds": _parse_form_bool(excludeCountryTlds),
+        "disallowedTlds": sorted(_parse_tld_list_payload(tldDisallowList)),
+        "allowedTlds": sorted(_parse_tld_list_payload(tldAllowList)),
+    }
+    session["workspaceConfig"] = config_payload
+    session["updatedAt"] = time.time()
+    _persist_session(sessionId, session)
+    return {"sessionId": sessionId, "workspaceConfig": config_payload}
+
+
 @app.post("/api/session/dedupe")
 async def session_set_dedupe(
     sessionId: str = Form(...),
@@ -3166,6 +4187,7 @@ async def session_preview(
         dedupe_df=dedupe_df,
         include_rows=False,
         include_leads=False,
+        skip_network_checks=True,
     )
     return {
         "sessionId": sessionId,
@@ -3232,7 +4254,11 @@ async def session_rows(
 
     rows = []
     active_run = session.get("activeRun")
-    running_run = active_run if isinstance(active_run, dict) and active_run.get("status") == "running" else None
+    running_run = (
+        active_run
+        if isinstance(active_run, dict) and active_run.get("status") in {"running", "pausing", "paused"}
+        else None
+    )
     status_source = running_run or session.get("lastRunStatus")
 
     for item in page_df.to_dicts():
@@ -3254,6 +4280,76 @@ async def session_rows(
         "pageSize": safe_size,
         "qualificationProgress": _serialize_run_snapshot(active_run, include_result=False) if isinstance(active_run, dict) else None,
     }
+
+
+@app.post("/api/session/scrape/start")
+async def session_scrape_start(
+    sessionId: str = Form(...),
+    domainField: str = Form(""),
+):
+    """Start an async homepage scraping enrichment job for the current session."""
+    session = _touch_session(sessionId)
+    running_qualification = session.get("activeRun")
+    if isinstance(running_qualification, dict) and running_qualification.get("status") in {"running", "pausing"}:
+        raise HTTPException(status_code=409, detail="Qualification is running. Pause or finish it before starting scraper enrichment.")
+
+    active_scrape = session.get("activeScrape")
+    if isinstance(active_scrape, dict) and active_scrape.get("status") == "running":
+        payload = _serialize_scrape_snapshot(active_scrape, include_result=False)
+        payload["sessionId"] = sessionId
+        payload["alreadyRunning"] = True
+        return payload
+
+    df = _get_session_df(session)
+    resolved_domain_field = _resolve_scrape_domain_field(df, domainField or (session.get("workspaceConfig") or {}).get("domainField", ""))
+    if not resolved_domain_field:
+        raise HTTPException(status_code=400, detail="Select a valid domain/website column before starting scraper enrichment.")
+
+    scrape_id = uuid4().hex
+    now = time.time()
+    output_dir = SCRAPE_JOB_DIR / sessionId / scrape_id
+    session["activeScrape"] = {
+        "scrapeId": scrape_id,
+        "status": "running",
+        "stage": "starting",
+        "progress": 0.01,
+        "message": "Preparing homepage scraping job...",
+        "processed": 0,
+        "total": 0,
+        "ok": 0,
+        "fail": 0,
+        "ratePerSec": 0.0,
+        "domainField": resolved_domain_field,
+        "outputDir": str(output_dir),
+        "startedAt": now,
+        "finishedAt": None,
+        "error": "",
+        "result": None,
+    }
+    session["updatedAt"] = now
+    _persist_session(sessionId, session)
+
+    asyncio.create_task(
+        _run_session_scrape_job(
+            session_id=sessionId,
+            scrape_id=scrape_id,
+            domain_field=resolved_domain_field,
+        )
+    )
+
+    payload = _serialize_scrape_snapshot(session.get("activeScrape"), include_result=False)
+    payload["sessionId"] = sessionId
+    payload["alreadyRunning"] = False
+    return payload
+
+
+@app.get("/api/session/scrape/progress")
+async def session_scrape_progress(sessionId: str):
+    """Read progress for active scraper enrichment job."""
+    session = _touch_session(sessionId)
+    payload = _serialize_scrape_snapshot(session.get("activeScrape"), include_result=True)
+    payload["sessionId"] = sessionId
+    return payload
 
 
 @app.post("/api/session/qualify/start")
@@ -3278,9 +4374,24 @@ async def session_qualify_start(
     exclude_country_tlds = _parse_form_bool(excludeCountryTlds)
     disallowed_tlds = _parse_tld_list_payload(tldDisallowList)
     allowed_tlds = _parse_tld_list_payload(tldAllowList)
+    workspace_config = {
+        "rules": parsed_rules,
+        "domainCheck": domain_check,
+        "homepageCheck": homepage_check,
+        "domainField": domainField,
+        "websiteKeywords": website_keywords,
+        "excludeCountryTlds": exclude_country_tlds,
+        "disallowedTlds": sorted(disallowed_tlds),
+        "allowedTlds": sorted(allowed_tlds),
+    }
+    session["workspaceConfig"] = workspace_config
+
+    active_scrape = session.get("activeScrape")
+    if isinstance(active_scrape, dict) and active_scrape.get("status") == "running":
+        raise HTTPException(status_code=409, detail="A homepage scrape is currently running. Wait for it to finish before qualification.")
 
     active = session.get("activeRun")
-    if isinstance(active, dict) and active.get("status") == "running":
+    if isinstance(active, dict) and active.get("status") in {"running", "pausing"}:
         payload = _serialize_run_snapshot(active, include_result=False)
         payload["sessionId"] = sessionId
         payload["alreadyRunning"] = True
@@ -3307,13 +4418,26 @@ async def session_qualify_start(
         "removedDomainIds": set(),
         "removedHubspotIds": set(),
         "qualifiedIds": set(),
+        "removedFilterReasonById": {},
         "removedDomainReasonById": {},
+        "pauseRequested": False,
+        "finishOnPause": False,
+        "pausedAt": None,
+        "warnings": [],
+        "domainResults": {
+            "checked": 0,
+            "homepageChecked": 0,
+            "dead": [],
+            "cdnReference": get_cdn_reference_data(),
+        },
+        "runConfig": workspace_config,
         "startedAt": now,
         "finishedAt": None,
         "error": "",
         "result": None,
     }
     session["updatedAt"] = now
+    _persist_session(sessionId, session)
 
     asyncio.create_task(
         _run_session_qualification_job(
@@ -3346,6 +4470,187 @@ async def session_qualify_progress(sessionId: str):
     return payload
 
 
+@app.post("/api/session/qualify/pause")
+async def session_qualify_pause(
+    sessionId: str = Form(...),
+    finishUnprocessed: str = Form("false"),
+):
+    """Pause a running qualification. Optionally finish by auto-disqualifying unprocessed rows."""
+    session = _touch_session(sessionId)
+    run = session.get("activeRun")
+    if not isinstance(run, dict):
+        raise HTTPException(status_code=400, detail="No active qualification run.")
+
+    finish_unprocessed = _parse_form_bool(finishUnprocessed)
+    status = str(run.get("status") or "")
+    if status in {"done", "error"}:
+        payload = _serialize_run_snapshot(run, include_result=True)
+        payload["sessionId"] = sessionId
+        return payload
+
+    if status == "paused":
+        if finish_unprocessed:
+            await _finalize_paused_run(
+                session_id=sessionId,
+                session=session,
+                run=run,
+                auto_disqualify_unprocessed=True,
+            )
+        payload = _serialize_run_snapshot(session.get("activeRun"), include_result=True)
+        payload["sessionId"] = sessionId
+        return payload
+
+    run["pauseRequested"] = True
+    run["finishOnPause"] = bool(finish_unprocessed)
+    run["status"] = "pausing"
+    run["stage"] = "pausing"
+    run["message"] = (
+        "Pause requested. Finishing current checks and auto-disqualifying unprocessed rows..."
+        if finish_unprocessed
+        else "Pause requested. Finishing current checks..."
+    )
+    session["updatedAt"] = time.time()
+    _persist_session(sessionId, session)
+
+    payload = _serialize_run_snapshot(run, include_result=False)
+    payload["sessionId"] = sessionId
+    return payload
+
+
+@app.post("/api/session/qualify/finish")
+async def session_qualify_finish(sessionId: str = Form(...)):
+    """Finish a paused run and auto-disqualify unprocessed rows."""
+    session = _touch_session(sessionId)
+    run = session.get("activeRun")
+    if not isinstance(run, dict):
+        raise HTTPException(status_code=400, detail="No active qualification run.")
+
+    status = str(run.get("status") or "")
+    if status in {"running", "pausing"}:
+        run["pauseRequested"] = True
+        run["finishOnPause"] = True
+        run["status"] = "pausing"
+        run["stage"] = "pausing"
+        run["message"] = "Finish requested. Completing current checks before finalizing..."
+        session["updatedAt"] = time.time()
+        _persist_session(sessionId, session)
+        payload = _serialize_run_snapshot(run, include_result=False)
+        payload["sessionId"] = sessionId
+        return payload
+
+    if status == "paused":
+        await _finalize_paused_run(
+            session_id=sessionId,
+            session=session,
+            run=run,
+            auto_disqualify_unprocessed=True,
+        )
+        payload = _serialize_run_snapshot(session.get("activeRun"), include_result=True)
+        payload["sessionId"] = sessionId
+        return payload
+
+    payload = _serialize_run_snapshot(run, include_result=True)
+    payload["sessionId"] = sessionId
+    return payload
+
+
+@app.post("/api/session/qualify/resume")
+async def session_qualify_resume(sessionId: str = Form(...)):
+    """Resume a paused run by starting a new run with stored config."""
+    session = _touch_session(sessionId)
+    active = session.get("activeRun")
+    if isinstance(active, dict) and active.get("status") in {"running", "pausing"}:
+        payload = _serialize_run_snapshot(active, include_result=False)
+        payload["sessionId"] = sessionId
+        payload["alreadyRunning"] = True
+        return payload
+    active_scrape = session.get("activeScrape")
+    if isinstance(active_scrape, dict) and active_scrape.get("status") == "running":
+        raise HTTPException(status_code=409, detail="A homepage scrape is currently running. Wait for it to finish before resuming qualification.")
+
+    run_config = dict((active or {}).get("runConfig") or session.get("workspaceConfig") or {})
+    parsed_rules = [item for item in (run_config.get("rules") or []) if isinstance(item, dict)]
+    domain_check = bool(run_config.get("domainCheck"))
+    homepage_check = bool(run_config.get("homepageCheck"))
+    domain_field = str(run_config.get("domainField") or "")
+    website_keywords = [str(v) for v in (run_config.get("websiteKeywords") or []) if str(v).strip()]
+    exclude_country_tlds = bool(run_config.get("excludeCountryTlds"))
+    disallowed_tlds = set(str(v) for v in (run_config.get("disallowedTlds") or []) if str(v).strip())
+    allowed_tlds = set(str(v) for v in (run_config.get("allowedTlds") or []) if str(v).strip())
+    df = _get_session_df(session)
+
+    run_id = uuid4().hex
+    now = time.time()
+    session["activeRun"] = {
+        "runId": run_id,
+        "status": "running",
+        "stage": "starting",
+        "progress": 0.02,
+        "message": "Resuming qualification run...",
+        "processedRows": 0,
+        "totalRows": int(df.height),
+        "qualifiedCount": 0,
+        "removedCount": 0,
+        "removedBreakdown": {
+            "removedFilter": 0,
+            "removedDomain": 0,
+            "removedHubspot": 0,
+        },
+        "removedFilterIds": set(),
+        "removedDomainIds": set(),
+        "removedHubspotIds": set(),
+        "qualifiedIds": set(),
+        "removedFilterReasonById": {},
+        "removedDomainReasonById": {},
+        "pauseRequested": False,
+        "finishOnPause": False,
+        "pausedAt": None,
+        "warnings": [],
+        "domainResults": {
+            "checked": 0,
+            "homepageChecked": 0,
+            "dead": [],
+            "cdnReference": get_cdn_reference_data(),
+        },
+        "runConfig": {
+            "rules": parsed_rules,
+            "domainCheck": domain_check,
+            "homepageCheck": homepage_check,
+            "domainField": domain_field,
+            "websiteKeywords": website_keywords,
+            "excludeCountryTlds": exclude_country_tlds,
+            "disallowedTlds": sorted(disallowed_tlds),
+            "allowedTlds": sorted(allowed_tlds),
+        },
+        "startedAt": now,
+        "finishedAt": None,
+        "error": "",
+        "result": None,
+    }
+    session["updatedAt"] = now
+    _persist_session(sessionId, session)
+
+    asyncio.create_task(
+        _run_session_qualification_job(
+            session_id=sessionId,
+            run_id=run_id,
+            parsed_rules=parsed_rules,
+            domain_check=domain_check,
+            homepage_check=homepage_check,
+            domain_field=domain_field,
+            website_keywords=website_keywords,
+            exclude_country_tlds=exclude_country_tlds,
+            disallowed_tlds=disallowed_tlds,
+            allowed_tlds=allowed_tlds,
+        )
+    )
+
+    payload = _serialize_run_snapshot(session.get("activeRun"), include_result=False)
+    payload["sessionId"] = sessionId
+    payload["alreadyRunning"] = False
+    return payload
+
+
 @app.post("/api/session/qualify")
 async def session_qualify(
     sessionId: str = Form(...),
@@ -3362,6 +4667,9 @@ async def session_qualify(
     try:
         start_time = time.perf_counter()
         session = _touch_session(sessionId)
+        active_scrape = session.get("activeScrape")
+        if isinstance(active_scrape, dict) and active_scrape.get("status") == "running":
+            raise HTTPException(status_code=409, detail="A homepage scrape is currently running. Wait for it to finish before qualification.")
         df = _get_session_df(session)
         dedupe_df = _get_session_dedupe_df(session)
         parsed_rules = _parse_rules_payload(rules)
@@ -3371,6 +4679,16 @@ async def session_qualify(
         exclude_country_tlds = _parse_form_bool(excludeCountryTlds)
         disallowed_tlds = _parse_tld_list_payload(tldDisallowList)
         allowed_tlds = _parse_tld_list_payload(tldAllowList)
+        session["workspaceConfig"] = {
+            "rules": parsed_rules,
+            "domainCheck": domain_check,
+            "homepageCheck": homepage_check,
+            "domainField": domainField,
+            "websiteKeywords": website_keywords,
+            "excludeCountryTlds": exclude_country_tlds,
+            "disallowedTlds": sorted(disallowed_tlds),
+            "allowedTlds": sorted(allowed_tlds),
+        }
 
         pipeline = await run_qualification_pipeline(
             df=df,
@@ -3426,9 +4744,13 @@ async def session_qualify(
             "qualifiedCount": int(result["qualifiedCount"]),
             "removedCount": int(result["removedCount"]),
             "removedBreakdown": result["removedBreakdown"],
+            "pauseRequested": False,
+            "finishOnPause": False,
+            "pausedAt": None,
             "startedAt": time.time(),
             "finishedAt": time.time(),
             "error": "",
+            "runConfig": dict(session.get("workspaceConfig") or {}),
             "result": result,
             **status_sets,
         }
@@ -3549,6 +4871,7 @@ async def preview_qualification(
         dedupe_df=dedupe_df,
         include_rows=False,
         include_leads=False,
+        skip_network_checks=True,
     )
 
     return {

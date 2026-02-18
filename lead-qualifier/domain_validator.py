@@ -469,6 +469,8 @@ async def check_domains_dns_batch(
     domains: list[str],
     concurrency: int = DEFAULT_DNS_CONCURRENCY,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    result_callback: Optional[Callable[[str, dict], None]] = None,
 ) -> dict:
     """
     Check many domains concurrently using async A-record DNS + GeoIP validation.
@@ -483,19 +485,40 @@ async def check_domains_dns_batch(
     """
     await init_cache()
 
-    raw_cached_results = await get_cached_domains_batch(domains)
+    normalized_domains: list[str] = []
+    seen_domains: set[str] = set()
+    for domain in domains:
+        clean = normalize_domain(str(domain or ""))
+        if not clean or clean in {"unknown", "n/a", "none", "null"}:
+            continue
+        if clean in seen_domains:
+            continue
+        seen_domains.add(clean)
+        normalized_domains.append(clean)
+
+    if not normalized_domains:
+        if progress_callback:
+            progress_callback(0, 0)
+        return {}
+
+    raw_cached_results = await get_cached_domains_batch(normalized_domains)
     cached_results = {
         domain: result
         for domain, result in raw_cached_results.items()
         if _cached_result_is_usable(result)
     }
     hydrated_cached = {domain: _result_from_cache(domain, result) for domain, result in cached_results.items()}
+    if result_callback:
+        for domain, result in hydrated_cached.items():
+            result_callback(domain, result)
 
-    uncached_domains = [d for d in domains if d not in cached_results]
+    uncached_domains = [d for d in normalized_domains if d not in cached_results]
+    if progress_callback and cached_results:
+        progress_callback(len(cached_results), len(normalized_domains))
 
     if not uncached_domains:
         if progress_callback:
-            progress_callback(len(domains), len(domains))
+            progress_callback(len(normalized_domains), len(normalized_domains))
         return hydrated_cached
 
     resolver = dns.asyncresolver.Resolver()
@@ -516,8 +539,16 @@ async def check_domains_dns_batch(
     for i in range(0, total_uncached, batch_size):
         batch = uncached_domains[i:i + batch_size]
         tasks = [asyncio.create_task(bounded_check(d)) for d in batch]
+        pending = set(tasks)
 
         for future in asyncio.as_completed(tasks):
+            if should_stop and should_stop():
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                return {**hydrated_cached, **uncached_results}
             try:
                 result = await future
             except Exception:
@@ -525,10 +556,13 @@ async def check_domains_dns_batch(
 
             if isinstance(result, dict):
                 uncached_results[result["domain"]] = result
+                if result_callback:
+                    result_callback(str(result.get("domain") or ""), result)
+            pending.discard(future)
 
             processed += 1
             if progress_callback:
-                progress_callback(processed, len(domains))
+                progress_callback(processed, len(normalized_domains))
 
     return {**hydrated_cached, **uncached_results}
 

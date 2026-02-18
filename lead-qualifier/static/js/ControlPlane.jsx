@@ -32,6 +32,8 @@ function ControlPlane({
     onExport,
     onResetConfig,
     loading,
+    scrapeProgress,
+    onStartScrape,
 }) {
     const dedupeInputRef = useRef();
     const [presetNameDraft, setPresetNameDraft] = useState(presetName || '');
@@ -47,6 +49,12 @@ function ControlPlane({
     const ruleCount = (config?.rules || []).filter(r => r.field).length;
     const hasTldFilter = !!(config?.tldCountryChk || (config?.tldDisallow || []).length);
     const hasHomepageKeywords = !!(config?.websiteKeywords || []).length;
+    const scrapeStatus = String(scrapeProgress?.status || 'idle');
+    const scrapeRunning = scrapeStatus === 'running';
+    const scrapeDone = scrapeStatus === 'done';
+    const scrapeError = scrapeStatus === 'error';
+    const scrapeProgressPct = Math.max(0, Math.min(100, Math.round((scrapeProgress?.progress || 0) * 100)));
+    const scrapeCanStart = !!(config?.domField && typeof onStartScrape === 'function' && !scrapeRunning);
     const gapReport = useMemo(
         () => buildIcpGapReport(session, config),
         [
@@ -285,6 +293,35 @@ function ControlPlane({
                             placeholder=".co.uk, .de, .fr, .com.au, .ca"
                         />
                     </div>
+                </section>
+
+                <section className="sheet-block">
+                    <div className="mini-card-title">Homepage scraper enrichment</div>
+                    <div className="switch-sub">Run async scraping once to add `scrape_*` columns (title, descriptions, headings, body text, and keywords) to this dataset.</div>
+                    <div className="btn-row mt12">
+                        <button
+                            type="button"
+                            className="btn btn-g"
+                            onClick={onStartScrape}
+                            disabled={!scrapeCanStart || loading}
+                        >
+                            {scrapeRunning ? <><span className="spinner" /> Scraping…</> : 'Run homepage scraper'}
+                        </button>
+                    </div>
+                    {scrapeStatus !== 'idle' && (
+                        <div className={`inline-help mt12 ${scrapeError ? 'err' : ''}`}>
+                            {scrapeRunning ? <span className="spinner" /> : <I.info />}
+                            {' '}
+                            {scrapeProgress?.message || 'Scraper status available.'}
+                            {' '}
+                            ({scrapeProgressPct}% · {Number(scrapeProgress?.processed || 0).toLocaleString()}/{Number(scrapeProgress?.total || 0).toLocaleString()})
+                        </div>
+                    )}
+                    {scrapeDone && scrapeProgress?.result?.warnings?.length > 0 && (
+                        <div className="inline-help mt12">
+                            <I.info /> {scrapeProgress.result.warnings[0]}
+                        </div>
+                    )}
                 </section>
 
                 <section className="sheet-block">

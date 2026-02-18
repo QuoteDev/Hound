@@ -100,7 +100,7 @@ function RuleRow({ rule, columns, columnProfiles, onChange, onRemove, canRemove 
     const profile = columnProfiles.find(c => c.name === rule.field);
     const isRange = rule.matchType === 'range';
     const isDateRange = rule.matchType === 'dates';
-    const isContains = rule.matchType === 'contains';
+    const isContains = rule.matchType === 'contains' || rule.matchType === 'not_contains';
     const isFuzzy = rule.matchType === 'fuzzy' || rule.matchType === 'excludes';
     const groups = rule.groups || [RuleGroup()];
 
