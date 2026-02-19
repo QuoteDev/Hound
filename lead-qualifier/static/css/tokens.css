@@ -36,17 +36,17 @@
 
   --line-subtle: #e2e7ef;
   --line-strong: #d5dce8;
-  --line-focus: #2f72f4;
+  --line-focus: #FF5D01;
 
   --text-primary: #1f2634;
   --text-secondary: #2f394b;
   --text-tertiary: #4f5b72;
   --text-muted: #77839b;
 
-  --accent: #2f72f4;
-  --accent-soft: rgba(47, 114, 244, 0.14);
-  --accent-strong: #1f61df;
-  --accent-text: #1f61df;
+  --accent: #FF5D01;
+  --accent-soft: rgba(255, 93, 1, 0.14);
+  --accent-strong: #e05300;
+  --accent-text: #e05300;
 
   --ok-text: #188a55;
   --warn-text: #a1700f;

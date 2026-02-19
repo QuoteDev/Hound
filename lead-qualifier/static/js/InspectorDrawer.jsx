@@ -15,6 +15,7 @@ function InspectorDrawer({ row }) {
     const status = row._rowStatus || RowStatus.QUALIFIED;
     const isDisqualified = String(status).startsWith('removed_');
     const primaryReason = reasons[0] || '';
+    const dedupeMatch = row._dedupeMatch && typeof row._dedupeMatch === 'object' ? row._dedupeMatch : null;
 
     const disqualificationSummary = (() => {
         if (!isDisqualified) return '';
@@ -42,6 +43,34 @@ function InspectorDrawer({ row }) {
                         <span>Primary reason</span>
                         <span>{RowReason(primaryReason)}</span>
                     </div>
+                )}
+                {status === RowStatus.REMOVED_HUBSPOT && dedupeMatch && (
+                    <>
+                        <div className="mini-row mt12">
+                            <span>Matched key type</span>
+                            <span>{String(dedupeMatch.keyType || '').toUpperCase() || '-'}</span>
+                        </div>
+                        <div className="mini-row">
+                            <span>Source field</span>
+                            <span>{dedupeMatch.sourceColumn || '-'}</span>
+                        </div>
+                        <div className="mini-row">
+                            <span>Source value</span>
+                            <span>{dedupeMatch.sourceValue || '-'}</span>
+                        </div>
+                        <div className="mini-row">
+                            <span>Dedupe field</span>
+                            <span>{dedupeMatch.hubspotColumn || '-'}</span>
+                        </div>
+                        <div className="mini-row">
+                            <span>Dedupe value</span>
+                            <span>{dedupeMatch.hubspotValue || '-'}</span>
+                        </div>
+                        <div className="mini-row">
+                            <span>Match mode</span>
+                            <span>{dedupeMatch.matchMode || 'exact'}</span>
+                        </div>
+                    </>
                 )}
             </section>
 

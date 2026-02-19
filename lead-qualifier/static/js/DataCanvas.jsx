@@ -15,12 +15,17 @@ function DataCanvas({
     onShowAllColumns,
     onRenameColumn,
     onFormatColumn,
+    onBulkExport,
+    onBulkStatus,
 }) {
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(100);
     const [selectedCell, setSelectedCell] = useState(null);
     const [checkedRows, setCheckedRows] = useState({});
+    const [focusedRowIndex, setFocusedRowIndex] = useState(-1);
+    const [showShortcutHelp, setShowShortcutHelp] = useState(false);
     const headerCheckboxRef = useRef(null);
+    const tableRef = useRef(null);
 
     const [previewRows, setPreviewRows] = useState([]);
     const [previewMeta, setPreviewMeta] = useState({
@@ -36,7 +41,7 @@ function DataCanvas({
     const hiddenColumns = columnPrefs?.hidden || {};
     const columnLabels = columnPrefs?.labels || {};
     const columnFormats = columnPrefs?.formats || {};
-    const visibleColumns = columns.filter(col => !hiddenColumns[col]);
+    const visibleColumns = columns.filter(col => !hiddenColumns[col] && col !== '_score_breakdown');
     const hiddenCount = columns.length - visibleColumns.length;
 
     const profileByName = useMemo(() => {
@@ -49,7 +54,7 @@ function DataCanvas({
 
     useEffect(() => {
         setPage(1);
-    }, [viewSearch, JSON.stringify(viewFilters), viewSort?.column, viewSort?.direction, pageSize]);
+    }, [viewSearch, viewFilters, viewSort?.column, viewSort?.direction, pageSize]);
 
     useEffect(() => {
         if (isReviewData || !session?.sessionId || columns.length === 0) return;
@@ -92,7 +97,7 @@ function DataCanvas({
             cancelled = true;
             clearTimeout(timer);
         };
-    }, [isReviewData, session?.sessionId, session?.totalRows, columns.length, page, pageSize, viewSearch, viewSort?.column, viewSort?.direction, JSON.stringify(viewFilters), runProgressSignal]);
+    }, [isReviewData, session?.sessionId, session?.totalRows, columns.length, page, pageSize, viewSearch, viewSort?.column, viewSort?.direction, viewFilters, runProgressSignal]);
 
     const matchesViewFilter = (row, filter) => {
         const raw = row?.[filter.field];
@@ -188,6 +193,44 @@ function DataCanvas({
         setCheckedRows({});
     }, [viewSearch, JSON.stringify(viewFilters), viewSort?.column, viewSort?.direction, page, pageSize, isReviewData]);
 
+    useEffect(() => {
+        const handler = (e) => {
+            // Don't intercept when typing in inputs
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+
+            if (e.key === '?') {
+                e.preventDefault();
+                setShowShortcutHelp(prev => !prev);
+                return;
+            }
+
+            if (!currentRows.length) return;
+
+            if (e.key === 'ArrowDown' || e.key === 'j') {
+                e.preventDefault();
+                setFocusedRowIndex(prev => Math.min(prev + 1, currentRows.length - 1));
+            } else if (e.key === 'ArrowUp' || e.key === 'k') {
+                e.preventDefault();
+                setFocusedRowIndex(prev => Math.max(prev - 1, 0));
+            } else if (e.key === 'Enter' && focusedRowIndex >= 0 && focusedRowIndex < currentRows.length) {
+                e.preventDefault();
+                const row = currentRows[focusedRowIndex];
+                const rowId = row._rowId ?? `${safePage}-${focusedRowIndex}`;
+                onSelectRow({ ...row, _rowId: rowId }, { openInspector: true });
+            } else if (e.key === 'q' && focusedRowIndex >= 0 && focusedRowIndex < currentRows.length) {
+                const row = currentRows[focusedRowIndex];
+                const rowId = row._rowId;
+                if (rowId != null && onBulkStatus) onBulkStatus([rowId], 'qualified');
+            } else if (e.key === 'x' && focusedRowIndex >= 0 && focusedRowIndex < currentRows.length) {
+                const row = currentRows[focusedRowIndex];
+                const rowId = row._rowId;
+                if (rowId != null && onBulkStatus) onBulkStatus([rowId], 'removed_manual');
+            }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+    }, [currentRows, focusedRowIndex, safePage, onSelectRow, onBulkStatus]);
+
     const toggleSort = (col) => {
         const activeCol = viewSort?.column;
         const activeDir = viewSort?.direction;
@@ -251,6 +294,8 @@ function DataCanvas({
         removed_filter: { label: 'Excluded', tone: 'excluded', icon: <I.x /> },
         removed_domain: { label: 'Excluded', tone: 'excluded', icon: <I.x /> },
         removed_hubspot: { label: 'Excluded', tone: 'excluded', icon: <I.x /> },
+        removed_intra_dedupe: { label: 'Duplicate', tone: 'excluded', icon: <I.x /> },
+        removed_manual: { label: 'Excluded', tone: 'excluded', icon: <I.x /> },
     };
 
     const rowIdsOnPage = currentRows.map((row, idx) => row._rowId ?? `${safePage}-${idx}`);
@@ -282,6 +327,21 @@ function DataCanvas({
         });
     };
 
+    const checkedRowIds = Object.keys(checkedRows).filter(k => checkedRows[k]);
+    const checkedCount = checkedRowIds.length;
+
+    const handleBulkExport = () => {
+        if (typeof onBulkExport === 'function') onBulkExport(checkedRowIds);
+    };
+    const handleBulkQualify = () => {
+        if (typeof onBulkStatus === 'function') onBulkStatus(checkedRowIds, 'qualified');
+        setCheckedRows({});
+    };
+    const handleBulkExclude = () => {
+        if (typeof onBulkStatus === 'function') onBulkStatus(checkedRowIds, 'removed_manual');
+        setCheckedRows({});
+    };
+
     return (
         <div className="dc-shell">
             <div className="dc-header-row">
@@ -307,6 +367,16 @@ function DataCanvas({
                     </select>
                 </label>
             </div>
+
+            {someOnPageChecked && (
+                <div className="bulk-action-bar">
+                    <span className="bulk-count">{checkedCount} selected</span>
+                    {isReviewData && <button className="btn btn-g" type="button" onClick={handleBulkExport}>Export selected</button>}
+                    {isReviewData && <button className="btn btn-g" type="button" onClick={handleBulkQualify}>Mark qualified</button>}
+                    {isReviewData && <button className="btn btn-g" type="button" onClick={handleBulkExclude}>Exclude selected</button>}
+                    <button className="btn btn-t" type="button" onClick={() => setCheckedRows({})}>Clear selection</button>
+                </div>
+            )}
 
             {!isReviewData && previewMeta.error && (
                 <div className="inline-msg err"><I.alertTri /> {previewMeta.error}</div>
@@ -409,7 +479,7 @@ function DataCanvas({
                                     return (
                                         <tr
                                             key={rowId}
-                                            className={`row-${status} ${String(status || '').startsWith('removed_') ? 'row-removed' : ''} ${selectedRowId === rowId ? 'row-selected' : ''}`}
+                                            className={`row-${status} ${String(status || '').startsWith('removed_') ? 'row-removed' : ''} ${selectedRowId === rowId ? 'row-selected' : ''} ${focusedRowIndex === idx ? 'row-focused' : ''}`}
                                             onClick={() => onSelectRow({ ...row, _rowId: rowId }, { openInspector: false })}
                                             onDoubleClick={() => onSelectRow({ ...row, _rowId: rowId }, { openInspector: true })}
                                             onKeyDown={(event) => {
@@ -436,7 +506,35 @@ function DataCanvas({
                                                     <span>{statusMeta.label}</span>
                                                 </span>
                                             </td>
-                                            {visibleColumns.map(col => (
+                                            {visibleColumns.map(col => {
+                                                if (col === '_lead_score') {
+                                                    const scoreVal = parseFloat(row[col]);
+                                                    const hasScore = !isNaN(scoreVal);
+                                                    const scoreStyle = hasScore
+                                                        ? scoreVal >= 70
+                                                            ? { background: '#e6f9e6', color: '#1a7a1a' }
+                                                            : scoreVal >= 40
+                                                                ? { background: '#fff8e1', color: '#8a6d00' }
+                                                                : { background: '#fde8e8', color: '#c62828' }
+                                                        : {};
+                                                    return (
+                                                        <td
+                                                            key={col}
+                                                            title={row[col]}
+                                                            className={selectedCell?.rowId === rowId && selectedCell?.column === col ? 'cell-selected' : ''}
+                                                            onClick={(event) => {
+                                                                event.stopPropagation();
+                                                                setSelectedCell({ rowId, column: col });
+                                                                onSelectRow({ ...row, _rowId: rowId }, { openInspector: false });
+                                                            }}
+                                                        >
+                                                            {hasScore
+                                                                ? <span className="score-pill" style={{ ...scoreStyle, padding: '2px 8px', borderRadius: '10px', fontWeight: 600, fontSize: '12px', display: 'inline-block' }}>{Math.round(scoreVal)}</span>
+                                                                : String(row[col] ?? '')}
+                                                        </td>
+                                                    );
+                                                }
+                                                return (
                                                 <td
                                                     key={col}
                                                     title={row[col]}
@@ -449,7 +547,8 @@ function DataCanvas({
                                                 >
                                                     {renderTableCell(col, row[col], getColumnFormat(col))}
                                                 </td>
-                                            ))}
+                                                );
+                                            })}
                                         </tr>
                                     );
                                 })}
@@ -475,6 +574,20 @@ function DataCanvas({
                         </div>
                     </div>
                 </>
+            )}
+            {showShortcutHelp && (
+                <div className="shortcut-help-overlay" onClick={() => setShowShortcutHelp(false)}>
+                    <div className="shortcut-help-card" onClick={e => e.stopPropagation()}>
+                        <div className="shortcut-help-title">Keyboard Shortcuts</div>
+                        <div className="shortcut-row"><kbd>↑</kbd> / <kbd>k</kbd> Move up</div>
+                        <div className="shortcut-row"><kbd>↓</kbd> / <kbd>j</kbd> Move down</div>
+                        <div className="shortcut-row"><kbd>Enter</kbd> Inspect row</div>
+                        <div className="shortcut-row"><kbd>q</kbd> Qualify row</div>
+                        <div className="shortcut-row"><kbd>x</kbd> Exclude row</div>
+                        <div className="shortcut-row"><kbd>?</kbd> Toggle shortcuts</div>
+                        <button className="btn btn-t mt12" onClick={() => setShowShortcutHelp(false)}>Close</button>
+                    </div>
+                </div>
             )}
         </div>
     );

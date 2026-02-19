@@ -27,10 +27,10 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_PHASE1_CONCURRENCY = 600
-DEFAULT_PHASE1_TIMEOUT = 5.0
-DEFAULT_PHASE1_RETRY = 1
-DEFAULT_PHASE2_CONCURRENCY = 40
-DEFAULT_PHASE2_TIMEOUT = 10.0
+DEFAULT_PHASE1_TIMEOUT = 8.0
+DEFAULT_PHASE1_RETRY = 2
+DEFAULT_PHASE2_CONCURRENCY = 80
+DEFAULT_PHASE2_TIMEOUT = 15.0
 DEFAULT_KEYWORD_COUNT = 20
 
 RANDOM_VIEWPORTS = [
@@ -268,7 +268,8 @@ async def fetch_with_curl(
         except Exception as exc:
             last_error = f"{type(exc).__name__}:{exc}"
         if attempt < retry_count:
-            await asyncio.sleep(0.08)
+            backoff = min(0.15 * (2 ** attempt), 1.0) + random.uniform(0, 0.1)
+            await asyncio.sleep(backoff)
 
     return {
         "domain": target.domain,
@@ -663,13 +664,22 @@ def extract_keywords(merged_path: Path, enriched_path: Path, top_k: int = DEFAUL
         vectorizer = TfidfVectorizer(stop_words="english", max_features=80000, ngram_range=(1, 2), min_df=2)
         matrix = vectorizer.fit_transform(corpus)
         vocab = vectorizer.get_feature_names_out()
-        for i in range(matrix.shape[0]):
-            row = matrix.getrow(i)
-            if row.nnz == 0:
+        # Use numpy argsort on the CSR matrix for fast top-k per row
+        import numpy as np
+        csr = matrix.tocsr()
+        for i in range(csr.shape[0]):
+            start, end = csr.indptr[i], csr.indptr[i + 1]
+            if start == end:
                 keywords.append("")
                 continue
-            pairs = sorted(zip(row.indices, row.data), key=lambda item: item[1], reverse=True)[:top_k]
-            tokens = [str(vocab[idx]) for idx, _ in pairs]
+            row_indices = csr.indices[start:end]
+            row_data = csr.data[start:end]
+            if len(row_data) <= top_k:
+                top_idx = np.argsort(row_data)[::-1]
+            else:
+                top_idx = np.argpartition(row_data, -top_k)[-top_k:]
+                top_idx = top_idx[np.argsort(row_data[top_idx])[::-1]]
+            tokens = [str(vocab[row_indices[j]]) for j in top_idx]
             keywords.append(", ".join(tokens))
     except Exception:
         # Conservative fallback if TF-IDF fails.

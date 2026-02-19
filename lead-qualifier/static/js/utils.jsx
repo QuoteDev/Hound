@@ -61,6 +61,8 @@ const RowStatus = {
     REMOVED_FILTER: 'removed_filter',
     REMOVED_DOMAIN: 'removed_domain',
     REMOVED_HUBSPOT: 'removed_hubspot',
+    REMOVED_INTRA_DEDUPE: 'removed_intra_dedupe',
+    REMOVED_MANUAL: 'removed_manual',
 };
 
 /* ── Data Model Factories ─────────────────────────────────── */
@@ -92,6 +94,8 @@ function Rule(field, cols) {
         max: '',
         startDate: '',
         endDate: '',
+        includeBlankValues: false,
+        separator: ';',
     };
 }
 
@@ -112,6 +116,7 @@ function QualificationMeta(raw) {
         domainCheckEnabled: !!raw?.domainCheckEnabled,
         homepageCheckEnabled: !!raw?.homepageCheckEnabled,
         websiteKeywords: Array.isArray(raw?.websiteKeywords) ? raw.websiteKeywords : [],
+        websiteExcludeKeywords: Array.isArray(raw?.websiteExcludeKeywords) ? raw.websiteExcludeKeywords : [],
         tldFilter: raw?.tldFilter || {
             excludeCountryTlds: false,
             disallowList: [],
@@ -172,6 +177,9 @@ function RowReason(code) {
         if (value.startsWith('consumer_signal_')) {
             return `consumer/ecommerce signal (${value.replace('consumer_signal_', '').replaceAll('_', ' ')})`;
         }
+        if (value.startsWith('exclude_keyword_')) {
+            return `matched exclude keyword (${value.replace('exclude_keyword_', '').replaceAll('_', ' ')})`;
+        }
         return value.replaceAll('_', ' ');
     };
 
@@ -179,6 +187,8 @@ function RowReason(code) {
         qualified_passed_all_checks: 'Passed all checks',
         rule_filter_mismatch: 'Did not match filter rules',
         hubspot_duplicate_match: 'Found duplicate in attached dedupe files',
+        intra_dedupe_duplicate: 'Removed as intra-dataset duplicate',
+        manual_exclusion: 'Manually excluded by user',
         preview_only: 'Preview row (qualification not run yet)',
         qualification_in_progress: 'Qualification currently running for this row.',
         qualification_paused_pending: 'Qualification paused before this row was processed.',
@@ -186,6 +196,11 @@ function RowReason(code) {
     };
     if (!code) return 'No reason available';
     if (map[code]) return map[code];
+    if (code.startsWith('blocked_domain_')) {
+        const cat = code.replace('blocked_domain_', '');
+        const catLabel = BLOCKED_DOMAIN_CATEGORY_LABELS[cat] || cat;
+        return `Blocked non-company domain (${catLabel})`;
+    }
     if (code.startsWith('domain_')) {
         const detail = code.replace('domain_', '').toLowerCase();
         if (detail.startsWith('inconclusive_fetch_failed')) {
@@ -235,6 +250,8 @@ function RowStatusLabel(status) {
         removed_filter: 'Excluded',
         removed_domain: 'Excluded',
         removed_hubspot: 'Excluded',
+        removed_intra_dedupe: 'Excluded',
+        removed_manual: 'Excluded',
         error: 'Error',
     };
     return map[status] || String(status || '').replaceAll('_', ' ');
@@ -250,6 +267,8 @@ function RunSummary(raw) {
             removedFilter: 0,
             removedDomain: 0,
             removedHubspot: 0,
+            removedIntraDedupe: 0,
+            removedBlocklist: 0,
         },
         rows: raw?.rows || [],
         leads: raw?.leads || [],
@@ -297,7 +316,43 @@ const MATCH_TYPES = [
     { value: 'range', label: 'Numeric range' },
     { value: 'dates', label: 'Date range' },
     { value: 'excludes', label: 'Excludes (fuzzy)' },
+    { value: 'multivalue_any', label: 'Contains any value' },
+    { value: 'multivalue_all', label: 'Contains all values' },
+    { value: 'multivalue_exclude', label: 'Excludes value' },
+    { value: 'geo_country', label: 'Country filter' },
 ];
+
+/* ── Quick Filter Presets ─────────────────────────────────── */
+const QUICK_FILTER_PRESETS = [
+    {
+        id: 'enterprise_exclude',
+        name: 'Enterprise Exclusion',
+        description: 'Exclude companies using enterprise-grade tools',
+        matchType: 'multivalue_exclude',
+        tags: ['Marketo', 'Pardot', 'Eloqua', 'Salesforce', 'Adobe Analytics', 'Adobe Experience Platform', 'Oracle', 'SAP'],
+    },
+    {
+        id: 'b2b_signals',
+        name: 'B2B Signals',
+        description: 'Keep companies using popular B2B SaaS tools',
+        matchType: 'multivalue_any',
+        tags: ['Stripe', 'Segment', 'Amplitude', 'Intercom', 'Calendly', 'HubSpot', 'Zendesk'],
+    },
+    {
+        id: 'dev_tools',
+        name: 'Developer Tools',
+        description: 'Companies with developer documentation tools',
+        matchType: 'multivalue_any',
+        tags: ['Mintlify', 'GitBook', 'ReadMe', 'Swagger', 'Postman'],
+    },
+];
+
+const COUNTRY_PRESETS = {
+    'United States': ['US', 'United States', 'USA'],
+    'US + Canada': ['US', 'CA', 'United States', 'Canada', 'USA'],
+    'English-speaking': ['US', 'CA', 'GB', 'AU', 'NZ', 'IE', 'United States', 'Canada', 'United Kingdom', 'Australia', 'New Zealand', 'Ireland'],
+    'EU': ['DE', 'FR', 'ES', 'IT', 'NL', 'SE', 'NO', 'DK', 'FI', 'BE', 'PT', 'PL', 'CZ', 'AT', 'IE', 'Germany', 'France', 'Spain', 'Italy', 'Netherlands', 'Sweden'],
+};
 
 /* ── Domain Column Guessing ───────────────────────────────── */
 const DOMAIN_HINTS = ['website', 'domain', 'url', 'site', 'web', 'homepage', 'link'];
@@ -314,6 +369,8 @@ function guessDomainColumn(cols) {
 /* ── Smart Condition Auto-Detection ───────────────────────── */
 function guessCondition(colName, col) {
     const n = (colName || '').toLowerCase();
+    if (col && col.isMultiValue) return 'multivalue_any';
+    if (n.includes('country') || n.includes('nation') || n.includes('geo') || n.includes('region') || n.includes('location')) return 'geo_country';
     if (n.includes('date') || n.includes('time') || n.includes('created') || n.includes('updated') ||
         n.includes('founded') || n.includes('launched') || n.includes('timestamp')) return 'dates';
     if (n.includes('revenue') || n.includes('funding') || n.includes('amount') ||
@@ -447,7 +504,18 @@ function ruleSignature(
     dedupeSig,
     tldCountryChk,
     tldDisallow,
-    tldAllow
+    tldAllow,
+    intraDedupe,
+    intraDedupeCol,
+    intraDedupeStrategy,
+    websiteExcludeKeywords,
+    domainBlocklistEnabled,
+    domainBlocklistCategories,
+    customBlockedDomains,
+    scoreEnabled,
+    scoreWeights,
+    scoreDateField,
+    scoreHighSignalConfig
 ) {
     return JSON.stringify({
         rules,
@@ -455,12 +523,41 @@ function ruleSignature(
         homepageChk: !!homepageChk,
         domField,
         websiteKeywords: normalizeKeywordList(websiteKeywords),
+        websiteExcludeKeywords: normalizeKeywordList(websiteExcludeKeywords),
         dedupeSig,
         tldCountryChk: !!tldCountryChk,
         tldDisallow: normalizeTldList(tldDisallow),
         tldAllow: normalizeTldList(tldAllow),
+        intraDedupe: !!intraDedupe,
+        intraDedupeCol: intraDedupeCol || '',
+        intraDedupeStrategy: intraDedupeStrategy || 'first',
+        domainBlocklistEnabled: !!domainBlocklistEnabled,
+        domainBlocklistCategories: domainBlocklistCategories || {},
+        customBlockedDomains: customBlockedDomains || [],
+        scoreEnabled: !!scoreEnabled,
+        scoreWeights: scoreWeights || {},
+        scoreDateField: scoreDateField || '',
+        scoreHighSignalConfig: scoreHighSignalConfig || {},
     });
 }
+
+const BLOCKED_DOMAIN_CATEGORY_LABELS = {
+    blogs: 'Blog platforms',
+    dev_hosting: 'Dev hosting',
+    social: 'Social media',
+    parked: 'Parked / test',
+    email: 'Email providers',
+    marketplaces: 'Marketplaces',
+};
+
+const DEFAULT_BLOCKLIST_CATEGORIES = {
+    blogs: true,
+    dev_hosting: true,
+    social: true,
+    parked: true,
+    email: true,
+    marketplaces: true,
+};
 
 function defaultWorkspaceConfig(columns) {
     const firstField = columns?.[0]?.name || '';
@@ -471,9 +568,22 @@ function defaultWorkspaceConfig(columns) {
         domField: '',
         websiteKeywords: [],
         websiteKeywordsText: '',
+        websiteExcludeKeywords: [],
+        websiteExcludeKeywordsText: '',
         tldCountryChk: false,
         tldDisallow: [],
         tldAllow: [...DEFAULT_TLD_ALLOWLIST],
+        intraDedupe: false,
+        intraDedupeCol: '',
+        intraDedupeStrategy: 'first',
+        domainBlocklistEnabled: false,
+        domainBlocklistCategories: { ...DEFAULT_BLOCKLIST_CATEGORIES },
+        customBlockedDomains: [],
+        customBlockedDomainsText: '',
+        scoreEnabled: false,
+        scoreWeights: { richness: 25, diversity: 25, recency: 20, domain: 15, signal: 15 },
+        scoreDateField: '',
+        scoreHighSignalConfig: { column: '', values: [] },
     };
 }
 
@@ -483,9 +593,20 @@ function appendConfigFormData(fd, config) {
     fd.append('homepageCheck', config.homepageChk ? 'true' : 'false');
     fd.append('domainField', config.domField || '');
     fd.append('websiteKeywords', JSON.stringify(normalizeKeywordList(config.websiteKeywords || [])));
+    fd.append('websiteExcludeKeywords', JSON.stringify(normalizeKeywordList(config.websiteExcludeKeywords || [])));
     fd.append('excludeCountryTlds', config.tldCountryChk ? 'true' : 'false');
     fd.append('tldDisallowList', JSON.stringify(normalizeTldList(config.tldDisallow || [])));
     fd.append('tldAllowList', JSON.stringify(normalizeTldList(config.tldAllow || [])));
+    fd.append('intraDedupe', config.intraDedupe ? 'true' : 'false');
+    fd.append('intraDedupeColumns', JSON.stringify(config.intraDedupeCol ? [config.intraDedupeCol] : []));
+    fd.append('intraDedupeStrategy', config.intraDedupeStrategy || 'first');
+    fd.append('domainBlocklistEnabled', config.domainBlocklistEnabled ? 'true' : 'false');
+    fd.append('domainBlocklistCategories', JSON.stringify(config.domainBlocklistCategories || DEFAULT_BLOCKLIST_CATEGORIES));
+    fd.append('customBlockedDomains', JSON.stringify(config.customBlockedDomains || []));
+    fd.append('scoreEnabled', config.scoreEnabled ? 'true' : 'false');
+    fd.append('scoreWeights', JSON.stringify(config.scoreWeights || {}));
+    fd.append('scoreDateField', config.scoreDateField || '');
+    fd.append('scoreHighSignalConfig', JSON.stringify(config.scoreHighSignalConfig || {}));
 }
 
 function _makePresetId() {
@@ -542,6 +663,7 @@ function _sanitizeRecentRun(raw) {
             removedFilter: 0,
             removedDomain: 0,
             removedHubspot: 0,
+            removedIntraDedupe: 0,
         },
         completedAt,
         processingMs: Number(raw.processingMs || 0),
@@ -627,15 +749,29 @@ function exportConfigPreset(config) {
             max: String(rule?.max ?? ''),
             startDate: String(rule?.startDate ?? ''),
             endDate: String(rule?.endDate ?? ''),
+            includeBlankValues: !!rule?.includeBlankValues,
         })),
         domChk: !!config?.domChk,
         homepageChk: !!config?.homepageChk,
         domField: config?.domField || '',
         websiteKeywords: normalizeKeywordList(config?.websiteKeywords || []),
         websiteKeywordsText: String(config?.websiteKeywordsText ?? formatKeywordListInput(config?.websiteKeywords || [])),
+        websiteExcludeKeywords: normalizeKeywordList(config?.websiteExcludeKeywords || []),
+        websiteExcludeKeywordsText: String(config?.websiteExcludeKeywordsText ?? formatKeywordListInput(config?.websiteExcludeKeywords || [])),
         tldCountryChk: !!config?.tldCountryChk,
         tldDisallow: normalizeTldList(config?.tldDisallow || []),
         tldAllow: normalizeTldList(config?.tldAllow || []),
+        intraDedupe: !!config?.intraDedupe,
+        intraDedupeCol: config?.intraDedupeCol || '',
+        intraDedupeStrategy: config?.intraDedupeStrategy || 'first',
+        domainBlocklistEnabled: !!config?.domainBlocklistEnabled,
+        domainBlocklistCategories: config?.domainBlocklistCategories || { ...DEFAULT_BLOCKLIST_CATEGORIES },
+        customBlockedDomains: config?.customBlockedDomains || [],
+        customBlockedDomainsText: String(config?.customBlockedDomainsText ?? (config?.customBlockedDomains || []).join(', ')),
+        scoreEnabled: !!config?.scoreEnabled,
+        scoreWeights: config?.scoreWeights || { richness: 25, diversity: 25, recency: 20, domain: 15, signal: 15 },
+        scoreDateField: config?.scoreDateField || '',
+        scoreHighSignalConfig: config?.scoreHighSignalConfig || { column: '', values: [] },
     };
 }
 
@@ -663,6 +799,7 @@ function _buildRuleFromPreset(rawRule, columns) {
         max: String(rawRule?.max ?? ''),
         startDate: String(rawRule?.startDate ?? ''),
         endDate: String(rawRule?.endDate ?? ''),
+        includeBlankValues: !!rawRule?.includeBlankValues,
     };
 }
 
@@ -679,6 +816,9 @@ function importConfigPreset(presetConfig, columns) {
     const websiteKeywords = normalizeKeywordList(
         presetConfig?.websiteKeywords || parseKeywordListInput(presetConfig?.websiteKeywordsText || '')
     );
+    const websiteExcludeKeywords = normalizeKeywordList(
+        presetConfig?.websiteExcludeKeywords || parseKeywordListInput(presetConfig?.websiteExcludeKeywordsText || '')
+    );
 
     return {
         ...defaults,
@@ -688,9 +828,23 @@ function importConfigPreset(presetConfig, columns) {
         domField,
         websiteKeywords,
         websiteKeywordsText: String(presetConfig?.websiteKeywordsText ?? formatKeywordListInput(websiteKeywords)),
+        websiteExcludeKeywords,
+        websiteExcludeKeywordsText: String(presetConfig?.websiteExcludeKeywordsText ?? formatKeywordListInput(websiteExcludeKeywords)),
         tldCountryChk: !!presetConfig?.tldCountryChk,
         tldDisallow: normalizeTldList(presetConfig?.tldDisallow || []),
         tldAllow: normalizeTldList((presetConfig?.tldAllow || []).length ? presetConfig.tldAllow : DEFAULT_TLD_ALLOWLIST),
+        intraDedupe: !!presetConfig?.intraDedupe,
+        intraDedupeCol: presetConfig?.intraDedupeCol
+            || (Array.isArray(presetConfig?.intraDedupeColumns) ? presetConfig.intraDedupeColumns[0] || '' : ''),
+        intraDedupeStrategy: presetConfig?.intraDedupeStrategy || 'first',
+        domainBlocklistEnabled: !!presetConfig?.domainBlocklistEnabled,
+        domainBlocklistCategories: presetConfig?.domainBlocklistCategories || { ...DEFAULT_BLOCKLIST_CATEGORIES },
+        customBlockedDomains: presetConfig?.customBlockedDomains || [],
+        customBlockedDomainsText: String(presetConfig?.customBlockedDomainsText ?? (presetConfig?.customBlockedDomains || []).join(', ')),
+        scoreEnabled: !!presetConfig?.scoreEnabled,
+        scoreWeights: presetConfig?.scoreWeights || { richness: 25, diversity: 25, recency: 20, domain: 15, signal: 15 },
+        scoreDateField: presetConfig?.scoreDateField || '',
+        scoreHighSignalConfig: presetConfig?.scoreHighSignalConfig || { column: '', values: [] },
     };
 }
 
@@ -740,6 +894,19 @@ function deleteFilterPreset(presetId) {
     const next = current.filter(item => item.id !== presetId);
     const ok = _persistFilterPresets(next);
     return { ok, presets: next };
+}
+
+function renameFilterPreset(presetId, newName) {
+    const cleanName = String(newName || '').trim();
+    if (!cleanName) return { ok: false, presets: loadFilterPresets(), renamed: null };
+    const current = loadFilterPresets();
+    const now = new Date().toISOString();
+    const next = current.map(item =>
+        item.id === presetId ? { ...item, name: cleanName, updatedAt: now } : item
+    );
+    const ok = _persistFilterPresets(next);
+    const renamed = next.find(item => item.id === presetId) || null;
+    return { ok, presets: next, renamed };
 }
 
 function _normalizeHeaderName(value) {
@@ -918,7 +1085,7 @@ function buildIcpGapReport(session, config = {}) {
 function buildPayloadFromRules(rules) {
     return rules.filter(r => r.field).map(r => {
         if (r.matchType === 'range') {
-            return { field: r.field, matchType: r.matchType, values: [], threshold: r.threshold, min: r.min, max: r.max };
+            return { field: r.field, matchType: r.matchType, values: [], threshold: r.threshold, min: r.min, max: r.max, includeBlankValues: !!r.includeBlankValues };
         }
         if (r.matchType === 'dates') {
             return {
@@ -928,6 +1095,7 @@ function buildPayloadFromRules(rules) {
                 threshold: r.threshold,
                 startDate: r.startDate,
                 endDate: r.endDate,
+                includeBlankValues: !!r.includeBlankValues,
             };
         }
         const isContains = r.matchType === 'contains' || r.matchType === 'not_contains';
@@ -938,6 +1106,17 @@ function buildPayloadFromRules(rules) {
                 groups: r.groups.map(g => ({ tags: g.tags, logic: g.logic || 'and' })),
                 groupsLogic: r.groupsLogic || 'or',
                 threshold: r.threshold,
+            };
+        }
+        if (r.matchType?.startsWith('multivalue_')) {
+            const allTags = (r.groups || []).flatMap(g => g.tags || []);
+            return {
+                field: r.field,
+                matchType: r.matchType,
+                values: allTags,
+                logic: 'or',
+                threshold: r.threshold,
+                separator: r.separator || ';',
             };
         }
         const allTags = (r.groups || []).flatMap(g => g.tags || []);
@@ -1010,7 +1189,7 @@ function renderTableCell(columnName, value, format = 'auto') {
         return <span className={`cell-tag tone-${toneIdx}`}>{raw}</span>;
     }
 
-    if (col.includes('skill') && /^\\d+$/.test(raw)) {
+    if (col.includes('skill') && /^\d+$/.test(raw)) {
         const count = Math.max(0, Math.min(parseInt(raw, 10), 5));
         return (
             <span className="cell-stars" aria-label={`${count} stars`}>

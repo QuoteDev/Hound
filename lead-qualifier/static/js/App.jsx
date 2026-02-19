@@ -68,9 +68,13 @@ function App() {
     const [exportColumns, setExportColumns] = useState([]);
     const [showImportModal, setShowImportModal] = useState(true);
 
+    const [sessionList, setSessionList] = useState([]);
+
     const [loading, setLoading] = useState(false);
     const [loadMsg, setLoadMsg] = useState('');
     const [error, setError] = useState('');
+    const [dedupePreview, setDedupePreview] = useState(null);
+    const [scrapeCacheStats, setScrapeCacheStats] = useState(null);
     const [presets, setPresets] = useState(() => loadFilterPresets());
     const [selectedPresetId, setSelectedPresetId] = useState('');
     const [presetName, setPresetName] = useState('');
@@ -78,6 +82,9 @@ function App() {
     const currentSessionIdRef = useRef('');
     const runContextRef = useRef({});
     const restoringRef = useRef(false);
+    const configSignatureRef = useRef('');
+    const undoStackRef = useRef([]);
+    const [undoToast, setUndoToast] = useState(null);
 
     const sessionId = session?.sessionId;
     const hasDataset = !!sessionId;
@@ -101,8 +108,20 @@ function App() {
         dedupeSig,
         config.tldCountryChk,
         config.tldDisallow || [],
-        config.tldAllow || []
+        config.tldAllow || [],
+        config.intraDedupe,
+        config.intraDedupeCol,
+        config.intraDedupeStrategy,
+        config.websiteExcludeKeywords || [],
+        config.domainBlocklistEnabled,
+        config.domainBlocklistCategories || {},
+        config.customBlockedDomains || [],
+        config.scoreEnabled,
+        config.scoreWeights || {},
+        config.scoreDateField || '',
+        config.scoreHighSignalConfig || {}
     );
+    configSignatureRef.current = configSignature;
     const lastRunSig = runSummary?._configSignature || '';
     const isUnsaved = !!runSummary && configSignature !== lastRunSig;
     const hasTldFilter = !!(config.tldCountryChk || (config.tldDisallow || []).length);
@@ -292,6 +311,19 @@ function App() {
         setError('');
     }, [selectedPresetId, presets]);
 
+    const onRenamePreset = useCallback((presetId, newName) => {
+        const outcome = renameFilterPreset(presetId, newName);
+        setPresets(outcome.presets || []);
+        if (!outcome.ok) {
+            setError('Unable to rename preset.');
+            return;
+        }
+        if (outcome.renamed) {
+            setPresetName(outcome.renamed.name);
+        }
+        setError('');
+    }, []);
+
     const hydrateSessionState = useCallback((data) => {
         const nextSession = WorkspaceSession(data);
         const hasPersistedConfig = !!(data?.workspaceConfig && typeof data.workspaceConfig === 'object');
@@ -326,6 +358,90 @@ function App() {
         }));
     }, []);
 
+    const refreshSessionList = useCallback(async () => {
+        try {
+            const data = await requestJSON(`${API}/api/sessions`);
+            setSessionList(data.sessions || []);
+        } catch (_e) {
+            // Non-fatal if session list fails to load.
+        }
+    }, []);
+
+    useEffect(() => {
+        refreshSessionList();
+    }, [refreshSessionList]);
+
+    const onSwitchSession = useCallback(async (targetId) => {
+        if (targetId === sessionId) return;
+        setError('');
+        setLoading(true);
+        setLoadMsg('Switching table...');
+        try {
+            const data = await requestJSON(`${API}/api/session/state?sessionId=${encodeURIComponent(targetId)}`);
+            hydrateSessionState(data);
+        } catch (e) {
+            setError(e.message || 'Failed to switch table.');
+        } finally {
+            setLoading(false);
+            setLoadMsg('');
+        }
+    }, [sessionId, hydrateSessionState]);
+
+    const onDeleteSession = useCallback(async (targetId) => {
+        setError('');
+        try {
+            await requestJSON(`${API}/api/session/${encodeURIComponent(targetId)}`, { method: 'DELETE' });
+            await refreshSessionList();
+            if (targetId === sessionId) {
+                setShowImportModal(true);
+                setSession(WorkspaceSession({}));
+                setConfig(defaultWorkspaceConfig([]));
+                setEstimate(null);
+                setRunSummaries(prev => {
+                    const next = { ...prev };
+                    delete next[targetId];
+                    return next;
+                });
+            }
+        } catch (e) {
+            setError(e.message || 'Failed to delete table.');
+        }
+    }, [sessionId, refreshSessionList]);
+
+    const onRenameSession = useCallback(async (targetId, newName) => {
+        setError('');
+        try {
+            const fd = new FormData();
+            fd.append('sessionId', targetId);
+            fd.append('name', newName);
+            await requestJSON(`${API}/api/session/rename`, { method: 'POST', body: fd });
+            await refreshSessionList();
+            if (targetId === sessionId) {
+                setSession(prev => ({ ...prev, fileName: newName }));
+            }
+        } catch (e) {
+            setError(e.message || 'Failed to rename table.');
+        }
+    }, [sessionId, refreshSessionList]);
+
+    const onCreateBlankSession = useCallback(async (name) => {
+        setError('');
+        setLoading(true);
+        setLoadMsg('Creating table...');
+        try {
+            const fd = new FormData();
+            fd.append('name', name || 'Untitled');
+            const data = await requestJSON(`${API}/api/session/create`, { method: 'POST', body: fd });
+            hydrateSessionState(data);
+            await refreshSessionList();
+        } catch (e) {
+            setError(e.message || 'Failed to create table.');
+        } finally {
+            setLoading(false);
+            setLoadMsg('');
+        }
+    }, [hydrateSessionState, refreshSessionList]);
+
     const onUploadSource = useCallback(async (sourceFiles, dedupeFiles = []) => {
         setError('');
         const nextSourceFiles = Array.isArray(sourceFiles) ? sourceFiles : (sourceFiles ? [sourceFiles] : []);
@@ -348,13 +464,14 @@ function App() {
             nextDedupeFiles.forEach(file => fd.append('dedupeFiles', file));
             const data = await requestJSON(`${API}/api/session/upload`, { method: 'POST', body: fd });
             hydrateSessionState(data);
+            refreshSessionList();
         } catch (e) {
             setError(e.message || 'Upload failed.');
         } finally {
             setLoading(false);
             setLoadMsg('');
         }
-    }, [hydrateSessionState]);
+    }, [hydrateSessionState, refreshSessionList]);
 
     const onUploadDedupe = useCallback(async (files) => {
         const uploadFiles = Array.isArray(files) ? files : (files ? [files] : []);
@@ -399,6 +516,22 @@ function App() {
         }
     }, [sessionId]);
 
+    const onPreviewDedupe = useCallback(async () => {
+        if (!sessionId) return;
+        setError('');
+        try {
+            const fd = new FormData();
+            fd.append('sessionId', sessionId);
+            fd.append('intraDedupe', config.intraDedupe ? 'true' : 'false');
+            fd.append('intraDedupeColumns', JSON.stringify(config.intraDedupeCol ? [config.intraDedupeCol] : []));
+            fd.append('intraDedupeStrategy', config.intraDedupeStrategy || 'first');
+            const data = await requestJSON(`${API}/api/session/dedupe/preview`, { method: 'POST', body: fd });
+            setDedupePreview(data);
+        } catch (e) {
+            setError(e.message || 'Failed to preview duplicates.');
+        }
+    }, [sessionId, config.intraDedupe, config.intraDedupeCol, config.intraDedupeStrategy]);
+
     useEffect(() => {
         let cancelled = false;
         if (!sessionId) {
@@ -428,7 +561,7 @@ function App() {
         if (!donePayload?.result) return;
         const ctx = runContextRef.current[targetSessionId] || {};
         const summary = RunSummary(donePayload.result);
-        summary._configSignature = ctx.signatureAtRunStart || configSignature;
+        summary._configSignature = ctx.signatureAtRunStart || configSignatureRef.current;
         setRunSummaries(prev => ({ ...prev, [targetSessionId]: summary }));
 
         const completedAt = new Date().toISOString();
@@ -452,7 +585,7 @@ function App() {
         });
         setRunHistory(historyOutcome.runs || []);
         if (currentSessionIdRef.current === targetSessionId) closeDrawer();
-    }, [closeDrawer, configSignature, session?.fileName, session?.fileNames, session?.totalRows]);
+    }, [closeDrawer, session?.fileName, session?.fileNames, session?.totalRows]);
 
     const onRun = useCallback(async () => {
         if (!sessionId || !canRun) return;
@@ -561,10 +694,11 @@ function App() {
                 return next;
             });
             setEstimate(null);
+            await refreshScrapeCacheStats();
         } catch (e) {
             setError(e?.message || 'Scrape completed, but session refresh failed.');
         }
-    }, []);
+    }, [refreshScrapeCacheStats]);
 
     const onStartScrape = useCallback(async () => {
         if (!sessionId) return;
@@ -603,6 +737,29 @@ function App() {
             }));
         }
     }, [sessionId, config?.domField]);
+
+    const refreshScrapeCacheStats = useCallback(async () => {
+        try {
+            const data = await requestJSON(`${API}/api/cache/scrape/stats`);
+            setScrapeCacheStats(data);
+        } catch (_e) {
+            setScrapeCacheStats(null);
+        }
+    }, []);
+
+    const onClearScrapeCache = useCallback(async () => {
+        setError('');
+        try {
+            await requestJSON(`${API}/api/cache/scrape/clear`, { method: 'POST' });
+            setScrapeCacheStats({ total: 0, active: 0, expired: 0 });
+        } catch (e) {
+            setError(e.message || 'Failed to clear scrape cache.');
+        }
+    }, []);
+
+    useEffect(() => {
+        refreshScrapeCacheStats();
+    }, [refreshScrapeCacheStats]);
 
     useEffect(() => {
         if (!sessionId) return;
@@ -744,6 +901,133 @@ function App() {
         }
     }, [sessionId, config, exportName, selectedExportColumns]);
 
+    const exportEnrichment = async () => {
+        if (!session?.sessionId) return;
+        setLoading(true);
+        try {
+            const fd = new FormData();
+            fd.append('sessionId', session.sessionId);
+            fd.append('fileName', (exportName || 'enrichment_export').replace(/\.csv$/i, '') + '_enrichment.csv');
+            const res = await fetch('/api/session/export/enrichment', { method: 'POST', body: fd });
+            if (!res.ok) throw new Error(await parseApiError(res));
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = (exportName || 'enrichment_export').replace(/\.csv$/i, '') + '_enrichment.csv';
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            setError(e.message || 'Enrichment export failed');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const onBulkExport = useCallback(async (rowIds) => {
+        if (!sessionId || !rowIds?.length) return;
+        setError('');
+        try {
+            const fd = new FormData();
+            fd.append('sessionId', sessionId);
+            fd.append('rowIds', JSON.stringify(rowIds));
+            fd.append('exportColumns', JSON.stringify(selectedExportColumns));
+            const blob = await requestBlob(`${API}/api/session/rows/bulk-export`, { method: 'POST', body: fd });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'selected_rows.csv';
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            setError(e.message || 'Bulk export failed.');
+        }
+    }, [sessionId, selectedExportColumns]);
+
+    const onBulkStatus = useCallback(async (rowIds, newStatus) => {
+        if (!sessionId || !rowIds?.length) return;
+        setError('');
+
+        // Determine undo status (opposite action)
+        const undoStatus = newStatus === 'qualified' ? 'removed_manual' : 'qualified';
+
+        try {
+            const fd = new FormData();
+            fd.append('sessionId', sessionId);
+            fd.append('rowIds', JSON.stringify(rowIds));
+            fd.append('newStatus', newStatus);
+            const data = await requestJSON(`${API}/api/session/rows/bulk-status`, { method: 'POST', body: fd });
+            setRunSummaries(prev => {
+                const current = prev[sessionId];
+                if (!current) return prev;
+                return {
+                    ...prev,
+                    [sessionId]: {
+                        ...current,
+                        qualifiedCount: data.qualifiedCount,
+                        removedCount: data.removedCount,
+                    },
+                };
+            });
+
+            // Push to undo stack (max 10 entries)
+            const undoEntry = { rowIds, previousStatus: undoStatus, sessionId };
+            undoStackRef.current = [...undoStackRef.current.slice(-9), undoEntry];
+
+            // Show toast
+            const action = newStatus === 'qualified' ? 'Qualified' : 'Excluded';
+            setUndoToast({ message: `${action} ${rowIds.length} lead${rowIds.length > 1 ? 's' : ''}`, ts: Date.now() });
+        } catch (e) {
+            setError(e.message || 'Bulk status update failed.');
+        }
+    }, [sessionId]);
+
+    const handleUndo = useCallback(async () => {
+        const entry = undoStackRef.current.pop();
+        if (!entry) return;
+        setError('');
+        try {
+            const fd = new FormData();
+            fd.append('sessionId', entry.sessionId);
+            fd.append('rowIds', JSON.stringify(entry.rowIds));
+            fd.append('newStatus', entry.previousStatus);
+            const data = await requestJSON(`${API}/api/session/rows/bulk-status`, { method: 'POST', body: fd });
+            setRunSummaries(prev => {
+                const current = prev[entry.sessionId];
+                if (!current) return prev;
+                return {
+                    ...prev,
+                    [entry.sessionId]: {
+                        ...current,
+                        qualifiedCount: data.qualifiedCount,
+                        removedCount: data.removedCount,
+                    },
+                };
+            });
+            setUndoToast(null);
+        } catch (e) {
+            setError(e.message || 'Undo failed.');
+        }
+    }, []);
+
+    useEffect(() => {
+        const handler = (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+                if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+                e.preventDefault();
+                handleUndo();
+            }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+    }, [handleUndo]);
+
+    useEffect(() => {
+        if (!undoToast) return;
+        const timer = setTimeout(() => setUndoToast(null), 8000);
+        return () => clearTimeout(timer);
+    }, [undoToast?.ts]);
+
     const onSelectRecentRun = useCallback(async (entry) => {
         const targetSessionId = String(entry?.sessionId || '').trim();
         if (!targetSessionId) {
@@ -780,6 +1064,22 @@ function App() {
         rules: [...(curr.rules || []), Rule(session?.columns?.[0]?.name || '', session?.columns || [])],
     }));
 
+    const addPresetRule = (preset) => {
+        const cols = session?.columns || [];
+        const mvCol = cols.find(c => c.isMultiValue);
+        const field = mvCol ? mvCol.name : (cols[0]?.name || '');
+        const newRule = {
+            ...Rule(field, cols),
+            matchType: preset.matchType,
+            separator: mvCol?.separator || ';',
+            groups: [{ ...RuleGroup(), tags: [...preset.tags] }],
+        };
+        setConfig(curr => ({ ...curr, rules: [...(curr.rules || []), newRule] }));
+    };
+
+    const toggleScore = (enabled) => setConfig(curr => ({ ...curr, scoreEnabled: enabled }));
+    const setScoreDateField = (field) => setConfig(curr => ({ ...curr, scoreDateField: field }));
+
     const addViewFilter = (filter) => {
         setViewFilters(curr => [...curr, ViewFilter(filter)]);
     };
@@ -799,7 +1099,7 @@ function App() {
             value: String(filter?.value || ''),
             value2: String(filter?.value2 || ''),
         })),
-    }), [viewSearch, viewSort?.column, viewSort?.direction, JSON.stringify(viewFilters)]);
+    }), [viewSearch, viewSort?.column, viewSort?.direction, viewFilters]);
 
     const applySavedView = useCallback((view) => {
         if (!view) {
@@ -1056,6 +1356,7 @@ function App() {
                 onRuleUpdate={updateRule}
                 onRuleRemove={removeRule}
                 onRuleAdd={addRule}
+                onPresetRuleAdd={addPresetRule}
                 presets={presets}
                 selectedPresetId={selectedPresetId}
                 presetName={presetName}
@@ -1064,6 +1365,12 @@ function App() {
                 onSavePreset={onSavePreset}
                 onApplyPreset={onApplyPreset}
                 onDeletePreset={onDeletePreset}
+                onRenamePreset={onRenamePreset}
+                onToggleIntraDedupe={(checked) => setConfig(curr => ({ ...curr, intraDedupe: checked }))}
+                onIntraDedupeCol={(col) => setConfig(curr => ({ ...curr, intraDedupeCol: col }))}
+                onIntraDedupeStrategy={(strategy) => setConfig(curr => ({ ...curr, intraDedupeStrategy: strategy }))}
+                onPreviewDedupe={onPreviewDedupe}
+                dedupePreview={dedupePreview}
                 onToggleDomain={(checked) => setConfig(curr => {
                     const shouldKeepDomainField = checked || curr.homepageChk || curr.tldCountryChk || (curr.tldDisallow || []).length > 0;
                     const guessedField = curr.domField || guessDomainColumn(session?.columns || []);
@@ -1111,6 +1418,11 @@ function App() {
                     websiteKeywordsText: raw,
                     websiteKeywords: parseKeywordListInput(raw),
                 }))}
+                onWebsiteExcludeKeywords={(raw) => setConfig(curr => ({
+                    ...curr,
+                    websiteExcludeKeywordsText: raw,
+                    websiteExcludeKeywords: parseKeywordListInput(raw),
+                }))}
                 onUploadDedupe={onUploadDedupe}
                 onClearDedupe={onClearDedupe}
                 onExport={onExport}
@@ -1118,6 +1430,24 @@ function App() {
                 loading={loading}
                 scrapeProgress={scrapeProgress}
                 onStartScrape={onStartScrape}
+                scrapeCacheStats={scrapeCacheStats}
+                onClearScrapeCache={onClearScrapeCache}
+                onToggleBlocklist={(checked) => setConfig(curr => {
+                    const guessedField = curr.domField || guessDomainColumn(session?.columns || []);
+                    return { ...curr, domainBlocklistEnabled: checked, domField: checked ? guessedField : curr.domField };
+                })}
+                onBlocklistCategory={(cat, enabled) => setConfig(curr => ({
+                    ...curr,
+                    domainBlocklistCategories: { ...(curr.domainBlocklistCategories || {}), [cat]: enabled },
+                }))}
+                onCustomBlockedDomains={(raw) => setConfig(curr => ({
+                    ...curr,
+                    customBlockedDomainsText: raw,
+                    customBlockedDomains: raw.split(/[,\n]+/).map(s => s.trim().toLowerCase()).filter(Boolean),
+                }))}
+                onScoreToggle={toggleScore}
+                onScoreDateField={setScoreDateField}
+                onExportEnrichment={exportEnrichment}
             />
             );
 
@@ -1134,6 +1464,14 @@ function App() {
         <div>
             {error && <div className="inline-msg err"><I.alertTri /> {error}</div>}
 
+            {undoToast && (
+                <div className="undo-toast">
+                    <span>{undoToast.message}</span>
+                    <button className="btn btn-t" onClick={handleUndo}>Undo</button>
+                    <button className="undo-toast-dismiss" onClick={() => setUndoToast(null)}><I.x /></button>
+                </div>
+            )}
+
             <WorkspaceShell
                 leftRail={(
                     <LeftRail
@@ -1147,6 +1485,13 @@ function App() {
                         runHistory={runHistory}
                         jumpQuery={jumpQuery}
                         onJumpQuery={setJumpQuery}
+                        onOpenImportModal={() => setShowImportModal(true)}
+                        sessionList={sessionList}
+                        activeSessionId={sessionId}
+                        onSwitchSession={onSwitchSession}
+                        onDeleteSession={onDeleteSession}
+                        onRenameSession={onRenameSession}
+                        onCreateBlank={onCreateBlankSession}
                     />
                 )}
                 header={(
@@ -1207,6 +1552,8 @@ function App() {
                         onShowAllColumns={showAllColumns}
                         onRenameColumn={renameColumn}
                         onFormatColumn={formatColumn}
+                        onBulkExport={onBulkExport}
+                        onBulkStatus={onBulkStatus}
                     />
                 )}
                 drawer={drawerState !== DrawerState.NONE && (

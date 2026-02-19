@@ -59,6 +59,39 @@ B2B_POSITIVE_KEYWORDS = [
     "request demo",
     "contact sales",
     "for business",
+    "schedule demo",
+    "get started",
+    "solutions",
+    "customers",
+    "case study",
+    "case studies",
+    "roi",
+    "onboarding",
+    "client success",
+    "customer success",
+    "managed services",
+    "professional services",
+    "consulting",
+    "implementation",
+    "white paper",
+    "webinar",
+    "cloud",
+    "devops",
+    "machine learning",
+    "artificial intelligence",
+    "crm",
+    "erp",
+    "supply chain",
+    "logistics",
+    "fintech",
+    "healthtech",
+    "cybersecurity",
+    "single sign on",
+    "sso",
+    "oauth",
+    "scalable",
+    "real time",
+    "open source",
 ]
 
 DISQUALIFY_SIGNAL_KEYWORDS = [
@@ -75,6 +108,34 @@ DISQUALIFY_SIGNAL_KEYWORDS = [
     "wedding photography",
     "fashion store",
     "recipe blog",
+    "buy now",
+    "checkout",
+    "shopping cart",
+    "order now",
+    "coupon code",
+    "promo code",
+    "return policy",
+    "track your order",
+    "baby registry",
+    "gift card",
+    "clearance sale",
+    "daily deals",
+    "flash sale",
+    "handmade jewelry",
+    "pet supplies",
+    "beauty products",
+    "dating",
+    "horoscope",
+    "gambling",
+    "casino",
+    "forex trading",
+    "cryptocurrency trading",
+    "weight loss",
+    "diet pills",
+    "domain parking",
+    "under construction",
+    "site not found",
+    "403 forbidden",
 ]
 
 NON_USD_CURRENCY_SYMBOLS = ["\u20ac", "\u00a3", "\u00a5", "\u20b9", "\u20a9", "\u20bd", "\u20ba", "\u20ab", "\u20aa"]
@@ -175,6 +236,28 @@ def _normalize_match_text(text: str) -> str:
     return re.sub(r"\s+", " ", lowered).strip()
 
 
+_STEM_SUFFIXES = ("ing", "tion", "ment", "ness", "ity", "ive", "ous", "ful", "able", "ible", "ated", "ized", "ise", "ize")
+
+
+def _word_prefix_in(prefix: str, padded: str) -> bool:
+    """Check if prefix appears at the start of any word in padded text."""
+    idx = 0
+    target = f" {prefix}"
+    while True:
+        pos = padded.find(target, idx)
+        if pos < 0:
+            return False
+        # Must be preceded by a space (guaranteed by target) — just check it's a word prefix
+        after_idx = pos + len(target)
+        if after_idx >= len(padded):
+            return True
+        after_char = padded[after_idx]
+        # Match if the next char is a space (exact) or a letter (prefix of longer word)
+        if after_char == " " or after_char.isalnum():
+            return True
+        idx = pos + 1
+
+
 def _keyword_hits(haystack_lower: str, keywords: list[str]) -> list[str]:
     hay = _normalize_match_text(haystack_lower)
     if not hay:
@@ -185,14 +268,57 @@ def _keyword_hits(haystack_lower: str, keywords: list[str]) -> list[str]:
         token = _normalize_match_text(keyword)
         if not token:
             continue
+        # Exact word boundary match
         if f" {token} " in padded:
             out.append(keyword)
             continue
-        if len(token) >= 5:
-            singular = token[:-1] if token.endswith("s") else token
-            plural = singular + "s"
-            if f" {singular} " in padded or f" {plural} " in padded:
+        # Multi-word phrases: try exact substring, then plural/singular of last word
+        words = token.split()
+        if len(words) >= 2:
+            if token in hay:
                 out.append(keyword)
+                continue
+            # Try plural/singular of the last word (e.g., "case study" -> "case studies")
+            last = words[-1]
+            prefix = " ".join(words[:-1])
+            if last.endswith("y"):
+                alt_last = last[:-1] + "ies"
+            elif last.endswith("s"):
+                alt_last = last[:-1]
+            else:
+                alt_last = last + "s"
+            alt_phrase = f"{prefix} {alt_last}"
+            if alt_phrase in hay:
+                out.append(keyword)
+                continue
+        # Plural/singular variations for single words
+        if len(token) >= 4:
+            if token.endswith("ies"):
+                singular = token[:-3] + "y"
+            elif token.endswith("s"):
+                singular = token[:-1]
+            else:
+                singular = token
+            plural_s = singular + "s"
+            plural_ies = singular[:-1] + "ies" if singular.endswith("y") else None
+            for variant in (singular, plural_s, plural_ies):
+                if variant and f" {variant} " in padded:
+                    out.append(keyword)
+                    break
+            else:
+                # Word-prefix matching: "deploy" matches "deployment", "deploying", etc.
+                if len(token) >= 5 and _word_prefix_in(token, padded):
+                    out.append(keyword)
+                    continue
+                # Stem suffix stripping: "automated" -> "automat" matches "automation"
+                stem = token
+                for suffix in _STEM_SUFFIXES:
+                    if token.endswith(suffix) and len(token) > len(suffix) + 3:
+                        stem = token[: -len(suffix)]
+                        break
+                if stem != token and len(stem) >= 4 and _word_prefix_in(stem, padded):
+                    out.append(keyword)
+                    continue
     return out
 
 
@@ -225,6 +351,7 @@ def _empty_signal_result(domain: str) -> dict:
         "b2b_score": 0,
         "us_signals": False,
         "website_keywords_match": True,
+        "website_exclude_hits": [],
         "homepage_status": "inconclusive:fetch_failed",
         "homepage_disqualified": False,
     }
@@ -298,7 +425,7 @@ async def _fetch_homepage_excerpt(
                     follow_redirects=False,
                 ) as response:
                     status_label = f"http_{response.status_code}_via_ip"
-                    if response.status_code >= 400:
+                    if response.status_code >= 300:
                         last_status = status_label
                         continue
                     chunks: list[bytes] = []
@@ -329,6 +456,7 @@ def _compute_homepage_signals(
     domain: str,
     html: str,
     website_keywords: list[str],
+    website_exclude_keywords: Optional[list[str]] = None,
 ) -> dict:
     soup = BeautifulSoup(html or "", "lxml")
 
@@ -354,6 +482,8 @@ def _compute_homepage_signals(
     b2b_hits = _keyword_hits(b2b_text_lower, B2B_POSITIVE_KEYWORDS)
     disqualify_hits = _keyword_hits(signal_text_lower, DISQUALIFY_SIGNAL_KEYWORDS)
     website_hits = _keyword_hits(signal_text_lower, website_keywords)
+    exclude_kws = website_exclude_keywords or []
+    website_exclude_hits = _keyword_hits(signal_text_lower, exclude_kws) if exclude_kws else []
     currency_signals, currency_disqualify = _currency_signal(signal_text)
     us_signals = bool(
         US_PHONE_RE.search(signal_text)
@@ -389,6 +519,10 @@ def _compute_homepage_signals(
     elif consumer_score > 0:
         add_soft_reason(f"consumer_signal_{_normalize_reason(disqualify_hits[0])}", weight=1)
 
+    # User-specified exclusion keywords: hard disqualify if any match.
+    if website_exclude_hits:
+        hard_disqualify_reasons.append(f"exclude_keyword_{_normalize_reason(website_exclude_hits[0])}")
+
     # Keyword mismatch is important user intent, but still treated as a weighted soft strike.
     if website_keywords and not website_hits:
         add_soft_reason("website_keywords_no_match", weight=2)
@@ -420,6 +554,7 @@ def _compute_homepage_signals(
         "b2b_score": b2b_score,
         "us_signals": us_signals,
         "website_keywords_match": True if not website_keywords else bool(website_hits),
+        "website_exclude_hits": website_exclude_hits,
         "homepage_status": status,
         "homepage_disqualified": disqualified,
     }
@@ -429,6 +564,7 @@ async def collect_domain_homepage_signals(
     client: httpx.AsyncClient,
     domain: str,
     website_keywords: list[str],
+    website_exclude_keywords: Optional[list[str]] = None,
 ) -> dict:
     clean = _normalize_domain(domain)
     if not clean or "." not in clean:
@@ -445,12 +581,17 @@ async def collect_domain_homepage_signals(
         result["homepage_disqualified"] = False
         return result
 
-    return _compute_homepage_signals(domain, html, website_keywords=website_keywords)
+    return _compute_homepage_signals(
+        domain, html,
+        website_keywords=website_keywords,
+        website_exclude_keywords=website_exclude_keywords,
+    )
 
 
 async def collect_homepage_signals_batch(
     domains: list[str],
     website_keywords: Optional[list[str]] = None,
+    website_exclude_keywords: Optional[list[str]] = None,
     concurrency: int = DEFAULT_HOMEPAGE_CONCURRENCY,
     timeout_seconds: float = DEFAULT_HOMEPAGE_TIMEOUT_SECONDS,
     progress_callback: Optional[Callable[[int, int], None]] = None,
@@ -467,7 +608,14 @@ async def collect_homepage_signals_batch(
         for word in (website_keywords or [])
         if str(word or "").strip()
     ]
-    keywords_sig = hashlib.sha1("\x1f".join(normalized_keywords).encode("utf-8")).hexdigest()
+    normalized_exclude = [
+        str(word or "").strip().lower()
+        for word in (website_exclude_keywords or [])
+        if str(word or "").strip()
+    ]
+    # Include exclude keywords in cache signature so cache invalidates when they change
+    all_kw_for_sig = normalized_keywords + ["|EXCLUDE|"] + normalized_exclude
+    keywords_sig = hashlib.sha1("\x1f".join(all_kw_for_sig).encode("utf-8")).hexdigest()
 
     unique_domains: list[str] = []
     seen_domains: set[str] = set()
@@ -513,6 +661,7 @@ async def collect_homepage_signals_batch(
                     client=client,
                     domain=domain_value,
                     website_keywords=normalized_keywords,
+                    website_exclude_keywords=normalized_exclude,
                 )
 
         tasks = [asyncio.create_task(_bounded(domain)) for domain in fetch_domains]

@@ -77,15 +77,28 @@ function TagGroup({ group, onChangeGroup, onRemoveGroup, canRemoveGroup, col, ma
                 />
             </div>
 
-            {col && col.sampleValues?.length > 0 && (
-                <div className="tags" role="list" aria-label="Suggested values">
-                    {col.sampleValues.filter(v => !tags.includes(v)).slice(0, 20).map((value, index) => (
-                        <button type="button" key={index} className="tag" onClick={() => addTag(value)}>
-                            {value}
-                        </button>
-                    ))}
-                </div>
-            )}
+            {col && col.sampleValues?.length > 0 && (() => {
+                let suggestions = col.sampleValues;
+                if (matchType?.startsWith('multivalue_') && col.separator) {
+                    const seen = new Set();
+                    suggestions = [];
+                    for (const sv of col.sampleValues) {
+                        for (const part of String(sv).split(col.separator)) {
+                            const t = part.trim();
+                            if (t && !seen.has(t)) { seen.add(t); suggestions.push(t); }
+                        }
+                    }
+                }
+                return (
+                    <div className="tags" role="list" aria-label="Suggested values">
+                        {suggestions.filter(v => !tags.includes(v)).slice(0, 20).map((value, index) => (
+                            <button type="button" key={index} className="tag" onClick={() => addTag(value)}>
+                                {value}
+                            </button>
+                        ))}
+                    </div>
+                );
+            })()}
         </div>
     );
 }
@@ -117,7 +130,7 @@ function RuleRow({ rule, columns, columnProfiles, onChange, onRemove, canRemove 
         const field = event.target.value;
         const selected = columns.find(x => x.name === field);
         const mt = guessCondition(field, selected);
-        onChange({ field, matchType: mt, groups: [RuleGroup()], min: '', max: '', startDate: '', endDate: '' });
+        onChange({ field, matchType: mt, groups: [RuleGroup()], min: '', max: '', startDate: '', endDate: '', separator: selected?.separator || ';' });
     };
 
     return (
@@ -153,27 +166,77 @@ function RuleRow({ rule, columns, columnProfiles, onChange, onRemove, canRemove 
             </div>
 
             {isRange ? (
-                <div className="rule-range-grid">
-                    <div>
-                        <div className="rule-lbl"><I.hash /> Min</div>
-                        <input type="number" value={rule.min} onChange={e => onChange({ min: e.target.value })} placeholder="Minimum" />
+                <>
+                    <div className="rule-range-grid">
+                        <div>
+                            <div className="rule-lbl"><I.hash /> Min</div>
+                            <input type="number" value={rule.min} onChange={e => onChange({ min: e.target.value })} placeholder="Minimum" />
+                        </div>
+                        <div>
+                            <div className="rule-lbl"><I.hash /> Max</div>
+                            <input type="number" value={rule.max} onChange={e => onChange({ max: e.target.value })} placeholder="Maximum" />
+                        </div>
                     </div>
-                    <div>
-                        <div className="rule-lbl"><I.hash /> Max</div>
-                        <input type="number" value={rule.max} onChange={e => onChange({ max: e.target.value })} placeholder="Maximum" />
-                    </div>
-                </div>
+                    <label className="blank-toggle">
+                        <input
+                            type="checkbox"
+                            checked={!!rule.includeBlankValues}
+                            onChange={e => onChange({ includeBlankValues: e.target.checked })}
+                        />
+                        <span>Include rows with blank values</span>
+                    </label>
+                </>
             ) : isDateRange ? (
-                <div className="rule-range-grid">
-                    <div>
-                        <div className="rule-lbl">Start date</div>
-                        <input type="date" value={rule.startDate || ''} onChange={e => onChange({ startDate: e.target.value })} />
+                <>
+                    <div className="date-presets">
+                        {[
+                            { label: '6mo', months: 6 },
+                            { label: '12mo', months: 12 },
+                            { label: '18mo', months: 18 },
+                            { label: '24mo', months: 24 },
+                        ].map(preset => {
+                            const d = new Date();
+                            d.setMonth(d.getMonth() - preset.months);
+                            const presetDate = d.toISOString().split('T')[0];
+                            const isActive = rule.startDate === presetDate && !rule.endDate;
+                            return (
+                                <button
+                                    key={preset.label}
+                                    type="button"
+                                    className={`date-preset-btn ${isActive ? 'active' : ''}`}
+                                    onClick={() => onChange({ startDate: presetDate, endDate: '' })}
+                                >
+                                    {preset.label}
+                                </button>
+                            );
+                        })}
+                        <button
+                            type="button"
+                            className={`date-preset-btn ${rule.startDate && ![6,12,18,24].some(m => { const d = new Date(); d.setMonth(d.getMonth() - m); return rule.startDate === d.toISOString().split('T')[0] && !rule.endDate; }) ? 'active' : ''}`}
+                            onClick={() => {}}
+                        >
+                            Custom
+                        </button>
                     </div>
-                    <div>
-                        <div className="rule-lbl">End date</div>
-                        <input type="date" value={rule.endDate || ''} onChange={e => onChange({ endDate: e.target.value })} />
+                    <div className="rule-range-grid">
+                        <div>
+                            <div className="rule-lbl">Start date</div>
+                            <input type="date" value={rule.startDate || ''} onChange={e => onChange({ startDate: e.target.value })} />
+                        </div>
+                        <div>
+                            <div className="rule-lbl">End date</div>
+                            <input type="date" value={rule.endDate || ''} onChange={e => onChange({ endDate: e.target.value })} />
+                        </div>
                     </div>
-                </div>
+                    <label className="blank-toggle">
+                        <input
+                            type="checkbox"
+                            checked={!!rule.includeBlankValues}
+                            onChange={e => onChange({ includeBlankValues: e.target.checked })}
+                        />
+                        <span>Include rows with blank dates</span>
+                    </label>
+                </>
             ) : (
                 <div className="values-shell">
                     {groups.map((group, index) => (
@@ -211,7 +274,7 @@ function RuleRow({ rule, columns, columnProfiles, onChange, onRemove, canRemove 
                         </React.Fragment>
                     ))}
 
-                    {isContains && (
+                    {(isContains || (rule.matchType === 'multivalue_any') || (rule.matchType === 'multivalue_all')) && (
                         <button type="button" className="btn btn-t group-add-btn" onClick={addGroup}>
                             <I.plus /> Add group
                         </button>
@@ -229,6 +292,21 @@ function RuleRow({ rule, columns, columnProfiles, onChange, onRemove, canRemove 
                                 aria-label="Similarity threshold"
                             />
                             <span className="thresh-val">{rule.threshold}%</span>
+                        </div>
+                    )}
+
+                    {rule.matchType === 'geo_country' && (
+                        <div className="date-presets">
+                            {Object.entries(COUNTRY_PRESETS).map(([label, values]) => (
+                                <button
+                                    key={label}
+                                    type="button"
+                                    className="date-preset-btn"
+                                    onClick={() => onChange({ groups: [{ ...RuleGroup(), tags: values }] })}
+                                >
+                                    {label}
+                                </button>
+                            ))}
                         </div>
                     )}
                 </div>

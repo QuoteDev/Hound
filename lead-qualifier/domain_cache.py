@@ -27,6 +27,7 @@ def _cache_db_path() -> str:
 VALID_DOMAIN_TTL_DAYS = 7  # Cache valid domains for 7 days
 DEAD_DOMAIN_TTL_HOURS = 24  # Cache dead domains for 24 hours
 HOMEPAGE_TTL_HOURS = 72  # Cache homepage scrape results for 3 days
+SCRAPE_CACHE_TTL_DAYS = 7  # Cache scrape enrichment results for 7 days
 
 
 def _deserialize_ips(raw: Optional[str]) -> list[str]:
@@ -101,6 +102,17 @@ async def init_cache():
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_homepage_checked_at
             ON homepage_cache(checked_at)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS scrape_cache (
+                domain TEXT PRIMARY KEY,
+                result_json TEXT NOT NULL,
+                scraped_at TIMESTAMP NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_scrape_scraped_at
+            ON scrape_cache(scraped_at)
         """)
         await db.commit()
 
@@ -275,6 +287,12 @@ async def clear_expired_cache():
             WHERE checked_at < ?
         """, (homepage_cutoff,))
 
+        scrape_cutoff = (now - timedelta(days=SCRAPE_CACHE_TTL_DAYS)).isoformat()
+        await db.execute("""
+            DELETE FROM scrape_cache
+            WHERE scraped_at < ?
+        """, (scrape_cutoff,))
+
         await db.commit()
 
 
@@ -283,6 +301,7 @@ async def clear_all_cache():
     async with aiosqlite.connect(_cache_db_path()) as db:
         await db.execute("DELETE FROM domain_cache")
         await db.execute("DELETE FROM homepage_cache")
+        await db.execute("DELETE FROM scrape_cache")
         await db.commit()
 
 
@@ -327,6 +346,18 @@ async def get_cache_stats() -> dict:
             row = await cursor.fetchone()
             homepage_expired = row["count"]
 
+        async with db.execute("SELECT COUNT(*) as count FROM scrape_cache") as cursor:
+            row = await cursor.fetchone()
+            scrape_total = row["count"]
+
+        scrape_cutoff = (now - timedelta(days=SCRAPE_CACHE_TTL_DAYS)).isoformat()
+        async with db.execute(
+            "SELECT COUNT(*) as count FROM scrape_cache WHERE scraped_at < ?",
+            (scrape_cutoff,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            scrape_expired = row["count"]
+
         return {
             "total_entries": total,
             "alive_domains": breakdown.get("alive", 0),
@@ -334,6 +365,8 @@ async def get_cache_stats() -> dict:
             "expired_entries": expired,
             "homepage_entries": homepage_total,
             "homepage_expired_entries": homepage_expired,
+            "scrape_entries": scrape_total,
+            "scrape_expired_entries": scrape_expired,
         }
 
 
@@ -382,6 +415,96 @@ async def get_cached_homepages_batch(domains: list[str], keywords_sig: str) -> d
                 if isinstance(parsed, dict):
                     out[str(row["domain"]).strip().lower()] = parsed
     return out
+
+
+async def get_cached_scrapes_batch(domains: list[str]) -> dict[str, dict]:
+    """
+    Retrieve cached scrape enrichment results for a list of domains.
+    Returns {domain: result_dict} for non-expired entries.
+    """
+    clean_domains = []
+    seen: set[str] = set()
+    for domain in domains or []:
+        token = str(domain or "").strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        clean_domains.append(token)
+    if not clean_domains:
+        return {}
+
+    placeholders = ",".join("?" * len(clean_domains))
+    query = f"""
+        SELECT domain, result_json, scraped_at
+        FROM scrape_cache
+        WHERE domain IN ({placeholders})
+    """
+
+    out: dict[str, dict] = {}
+    now = datetime.now()
+    ttl = timedelta(days=SCRAPE_CACHE_TTL_DAYS)
+    async with aiosqlite.connect(_cache_db_path()) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, clean_domains) as cursor:
+            async for row in cursor:
+                scraped_at = _safe_parse_checked_at(row["scraped_at"])
+                if not scraped_at or (now - scraped_at) > ttl:
+                    continue
+                try:
+                    parsed = json.loads(str(row["result_json"] or "{}"))
+                except Exception:
+                    continue
+                if isinstance(parsed, dict):
+                    out[str(row["domain"]).strip().lower()] = parsed
+    return out
+
+
+async def set_cached_scrapes_batch(results: dict[str, dict]):
+    """Store scrape enrichment results for multiple domains."""
+    if not results:
+        return
+    now_iso = datetime.now().isoformat()
+    async with aiosqlite.connect(_cache_db_path()) as db:
+        for domain, result in results.items():
+            clean_domain = str(domain or "").strip().lower()
+            if not clean_domain:
+                continue
+            encoded = json.dumps(result if isinstance(result, dict) else {}, ensure_ascii=True, separators=(",", ":"))
+            await db.execute("""
+                INSERT OR REPLACE INTO scrape_cache
+                (domain, result_json, scraped_at)
+                VALUES (?, ?, ?)
+            """, (clean_domain, encoded, now_iso))
+        await db.commit()
+
+
+async def clear_scrape_cache():
+    """Clear all cached scrape enrichment entries."""
+    async with aiosqlite.connect(_cache_db_path()) as db:
+        await db.execute("DELETE FROM scrape_cache")
+        await db.commit()
+
+
+async def get_scrape_cache_stats() -> dict:
+    """Get scrape cache statistics."""
+    async with aiosqlite.connect(_cache_db_path()) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT COUNT(*) as count FROM scrape_cache") as cursor:
+            row = await cursor.fetchone()
+            total = row["count"]
+        now = datetime.now()
+        cutoff = (now - timedelta(days=SCRAPE_CACHE_TTL_DAYS)).isoformat()
+        async with db.execute(
+            "SELECT COUNT(*) as count FROM scrape_cache WHERE scraped_at < ?",
+            (cutoff,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            expired = row["count"]
+        return {
+            "total": total,
+            "active": total - expired,
+            "expired": expired,
+        }
 
 
 async def set_cached_homepage(domain: str, keywords_sig: str, result: dict):
